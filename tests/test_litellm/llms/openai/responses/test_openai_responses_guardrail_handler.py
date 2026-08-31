@@ -1285,8 +1285,12 @@ class TestBuildBlockSseChunks:
         )
         types = [payload["type"] for payload in payloads]
         assert "response.created" not in types
-        assert types[0] == "response.output_item.added"
-        assert payloads[0]["output_index"] == 3
+        assert types[0] == "response.output_item.done", (
+            "the open original output_item must be closed before the replacement is appended"
+        )
+        assert payloads[0]["output_index"] == 2
+        added_idx = types.index("response.output_item.added")
+        assert payloads[added_idx]["output_index"] == 3
         completed = payloads[-1]["response"]
         assert completed["id"] == "resp_live"
         assert completed["model"] == "gpt-5.4-mini-2026-01-01"

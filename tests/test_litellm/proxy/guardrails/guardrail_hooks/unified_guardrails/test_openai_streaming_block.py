@@ -205,6 +205,17 @@ async def test_chat_mid_stream_block_continues_the_completion():
 async def test_chat_end_of_stream_block_terminates_cleanly():
     collected = await _run_hook("/v1/chat/completions", _chat_stream(end=True), end_of_stream_only=True)
     _assert_no_error_frame(collected)
+    forwarded_finish_reasons = [
+        choice.finish_reason
+        for chunk in collected
+        if isinstance(chunk, ModelResponseStream)
+        for choice in chunk.choices
+        if choice.finish_reason is not None
+    ]
+    assert forwarded_finish_reasons == [], (
+        "the original terminal finish_reason must be withheld and replaced by the block sequence, "
+        "otherwise SDKs that stop on the first finish miss the policy text entirely"
+    )
     payloads = _sse_payloads(collected)
     assert BLOCK_MESSAGE in json.dumps(payloads)
     assert payloads[-1]["choices"][0]["finish_reason"] == "content_filter"
@@ -236,18 +247,35 @@ async def test_responses_buffered_block_emits_full_event_sequence():
 async def test_responses_mid_stream_block_continues_the_response():
     """Regression for the LIT-6496 500 error frame: after events were already
     forwarded, the block appends a new output item under the same response id
-    and closes with response.completed - never a second response.created."""
+    and closes with response.completed - never a second response.created.
+
+    Also covers strict Responses SDKs that require any prior in-progress output
+    item to reach ``output_item.done`` before ``response.completed``: the open
+    item's ``output_text.done``, ``content_part.done`` and ``output_item.done``
+    events must be synthesized before the replacement item is appended."""
     collected = await _run_hook("/v1/responses", _responses_stream(end=False))
     _assert_no_error_frame(collected)
     forwarded_types = [chunk["type"] for chunk in collected if isinstance(chunk, dict)]
     assert "response.created" in forwarded_types, "original events should have streamed before the block"
+    assert "response.output_item.done" not in forwarded_types, (
+        "the original stream stopped before closing its output item; the block sequence must close it"
+    )
     payloads = _sse_payloads(collected)
     assert payloads, "no block SSE chunks were emitted"
     block_types = [payload["type"] for payload in payloads]
     assert "response.created" not in block_types, "a mid-stream block must not restart the response"
-    assert block_types[0] == "response.output_item.added"
     assert block_types[-1] == "response.completed"
-    assert payloads[0]["output_index"] == 1, "the block item must continue after the original output item"
+    assert block_types[:3] == [
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+    ], "the block sequence must close the still-open original output item before appending the replacement"
+    for closing_payload in payloads[:3]:
+        assert closing_payload["output_index"] == 0
+    replacement_added_idx = block_types.index("response.output_item.added")
+    assert payloads[replacement_added_idx]["output_index"] == 1, (
+        "the block item must continue after the original output item"
+    )
     completed = payloads[-1]["response"]
     assert completed["id"] == "resp_live"
     assert completed["output"][0]["content"][0]["text"] == BLOCK_MESSAGE

@@ -1015,6 +1015,23 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                                     # Subsequent chunks - clear the text
                                     content_item["text"] = ""
 
+    def _check_streaming_has_ended(self, responses_so_far: Sequence[object]) -> bool:
+        """Return True once a chat completion chunk with a non-null ``finish_reason`` has been seen.
+
+        The unified streaming hook uses this to withhold the terminal chunk in
+        ``end_of_stream_only`` mode so a block detected during final moderation
+        can replace it, instead of arriving after the client already received a
+        ``finish_reason`` and stopped reading.
+        """
+        for item in responses_so_far:
+            choices: Final = stream_item_field(item, "choices")
+            if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)):
+                continue
+            for choice in choices:
+                if stream_item_field(choice, "finish_reason") is not None:
+                    return True
+        return False
+
     def build_block_sse_chunks(
         self,
         exc: "ModifyResponseException",

@@ -905,6 +905,7 @@ class OpenAIResponsesHandler(BaseTranslation):
         exc: "ModifyResponseException", responses_so_far: Sequence[object]
     ) -> Sequence[ResponsesAPIStreamingResponse]:
         response_id, model, output_index = _continuation_identity(exc, responses_so_far)
+        closing_events: Final = OpenAIResponsesHandler._close_open_output_items(responses_so_far)
         item: Final = _blocked_output_item(exc)
         item_id: Final = item.id
         part: Final[_BlockedContentPart] = {"type": "output_text", "text": exc.message, "annotations": ()}
@@ -915,6 +916,7 @@ class OpenAIResponsesHandler(BaseTranslation):
             "logprobs": None,
         }
         return (
+            *closing_events,
             OutputItemAddedEvent(
                 type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
                 output_index=output_index,
@@ -958,6 +960,109 @@ class OpenAIResponsesHandler(BaseTranslation):
                 response=_blocked_response(exc, response_id=response_id, model=model, output_item=item),
             ),
         )
+
+    @staticmethod
+    def _close_open_output_items(
+        responses_so_far: Sequence[object],
+    ) -> Sequence[ResponsesAPIStreamingResponse]:
+        """Emit close events for any output item that was ``output_item.added``
+        but never ``output_item.done`` before the block. Strict Responses SDKs
+        reject a ``response.completed`` that arrives while a prior output item
+        or content part is still open, so we close each open item (and its open
+        content parts) in ascending ``output_index`` order before appending the
+        replacement item."""
+        open_items: dict[int, dict[str, object]] = {}
+        for chunk in responses_so_far:
+            event_type = stream_item_field(chunk, "type")
+            oi = stream_item_field(chunk, "output_index")
+            if not isinstance(event_type, str) or not isinstance(oi, int):
+                continue
+            if event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value:
+                open_items[oi] = {
+                    "item": stream_item_field(chunk, "item"),
+                    "content_parts": {},
+                }
+                continue
+            if event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE.value:
+                open_items.pop(oi, None)
+                continue
+            state = open_items.get(oi)
+            if state is None:
+                continue
+            parts = cast(dict[int, dict[str, object]], state["content_parts"])
+            ci = stream_item_field(chunk, "content_index")
+            if not isinstance(ci, int):
+                continue
+            if event_type == ResponsesAPIStreamEvents.CONTENT_PART_ADDED.value:
+                parts[ci] = {
+                    "item_id": stream_item_field(chunk, "item_id"),
+                    "text": "",
+                    "text_done": False,
+                    "part_done": False,
+                }
+            elif event_type == ResponsesAPIStreamEvents.CONTENT_PART_DONE.value and ci in parts:
+                parts[ci]["part_done"] = True
+            elif event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA.value:
+                delta = stream_item_field(chunk, "delta")
+                if isinstance(delta, str) and ci in parts:
+                    parts[ci]["text"] = cast(str, parts[ci]["text"]) + delta
+            elif event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE.value and ci in parts:
+                parts[ci]["text_done"] = True
+                text = stream_item_field(chunk, "text")
+                if isinstance(text, str):
+                    parts[ci]["text"] = text
+
+        events: list[ResponsesAPIStreamingResponse] = []
+        for oi in sorted(open_items.keys()):
+            state = open_items[oi]
+            item_obj = state["item"]
+            parts = cast(dict[int, dict[str, object]], state["content_parts"])
+            for ci in sorted(parts.keys()):
+                part_state = parts[ci]
+                item_id_raw = part_state.get("item_id")
+                item_id_str: str = item_id_raw if isinstance(item_id_raw, str) else ""
+                text_str = cast(str, part_state["text"])
+                if not part_state["text_done"]:
+                    events.append(
+                        OutputTextDoneEvent(
+                            type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
+                            item_id=item_id_str,
+                            output_index=oi,
+                            content_index=ci,
+                            text=text_str,
+                        )
+                    )
+                if not part_state["part_done"]:
+                    done_part_payload: _BlockedDoneContentPart = {
+                        "type": "output_text",
+                        "text": text_str,
+                        "annotations": (),
+                        "logprobs": None,
+                    }
+                    events.append(
+                        ContentPartDoneEvent(
+                            type=ResponsesAPIStreamEvents.CONTENT_PART_DONE,
+                            item_id=item_id_str,
+                            output_index=oi,
+                            content_index=ci,
+                            part=ContentPartDonePartOutputText.model_validate(done_part_payload),
+                        )
+                    )
+            done_item: BaseLiteLLMOpenAIResponseObject
+            if isinstance(item_obj, BaseLiteLLMOpenAIResponseObject):
+                done_item = item_obj
+            elif isinstance(item_obj, dict):
+                done_item = BaseLiteLLMOpenAIResponseObject.model_validate(item_obj)
+            else:
+                continue
+            events.append(
+                OutputItemDoneEvent(
+                    type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                    output_index=oi,
+                    item=done_item,
+                )
+            )
+        return tuple(events)
 
 
 class _BlockedContentPart(TypedDict):
