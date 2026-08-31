@@ -3,7 +3,7 @@ use litellm_core::chat_completions::chat_completions as run_chat_completions;
 use pyo3::prelude::*;
 use serde_json::{Map, Value};
 
-use crate::errors::{BridgeError, BridgeResult};
+use crate::errors::{BridgeResult, Error};
 use crate::marshal::{RouteOptions, object_or_empty, required_value};
 use crate::routes::BridgeRoute;
 
@@ -38,7 +38,7 @@ impl BridgeRoute<ChatCompletionsInputs> for ChatCompletionsCall {
                 optional_params: object_or_empty(py, "optional_params", inputs.optional_params)?,
             })
         })()
-        .map_err(BridgeError::declined)
+        .map_err(Error::declined)
     }
 
     async fn run(self) -> BridgeResult<ChatCompletionsResponse> {

@@ -3,7 +3,7 @@ use litellm_ai_gateway::io::responses_ws::ResponsesWebSocketConnection as RustCo
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};
 
-use crate::errors::BridgeResult;
+use crate::errors::{BridgeResult, Error};
 use crate::marshal::{optional_timeout, string_headers};
 use crate::routes::receiver::BridgeReceiver;
 use crate::routes::runtime::{run_async, run_async_with};
@@ -21,7 +21,7 @@ impl OpenedConnection {
     ) -> BridgeResult<Self> {
         let connection = RustConnection::connect_url(&url, &headers, timeout)
             .await
-            .map_err(crate::errors::BridgeError::from)?;
+            .map_err(Error::from)?;
         let inbound_connection = connection.clone();
         let inbound = BridgeReceiver::from_stream(stream::unfold(
             inbound_connection,

@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
-use litellm_core::error::CoreError;
+use litellm_core::error::{CoreError, ProviderCallError};
 use litellm_core::http_utils::truncate_error_body;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 use reqwest::{Client, Method, Response};
 
-use crate::errors::{BridgeError, BridgeResult};
+use crate::errors::{BridgeResult, Error};
 use crate::marshal::{optional_timeout, string_headers};
 use crate::routes::receiver::BridgeReceiver;
 use crate::routes::runtime::{run_async, run_async_with, run_sync_with};
@@ -53,13 +53,13 @@ impl HttpStreamCall {
                 read_idle_timeout: optional_timeout(read_idle_timeout_seconds),
             })
         })()
-        .map_err(BridgeError::declined)
+        .map_err(Error::declined)
     }
 
     async fn run(self) -> BridgeResult<OpenedHttpStream> {
         let client = Client::builder()
             .build()
-            .map_err(|error| BridgeError::declined(CoreError::Connect(error.to_string())))?;
+            .map_err(|error| Error::declined(CoreError::Connect(error.to_string())))?;
         let mut request = client.request(self.method, &self.url).body(self.body);
         for (name, value) in self.headers {
             request = request.header(name, value);
@@ -68,24 +68,26 @@ impl HttpStreamCall {
             Some(timeout) => tokio::time::timeout(timeout, request.send())
                 .await
                 .map_err(|_| {
-                    BridgeError::PossiblySent(CoreError::Network(
+                    Error::from(ProviderCallError::PossiblySent(CoreError::Network(
                         "stream response open timed out".to_string(),
-                    ))
+                    )))
                 })?,
             None => request.send().await,
         }
         .map_err(|error| {
             if error.is_connect() || error.is_builder() {
-                BridgeError::declined(CoreError::Connect(error.to_string()))
+                Error::declined(CoreError::Connect(error.to_string()))
             } else {
-                BridgeError::PossiblySent(CoreError::Network(error.to_string()))
+                Error::from(ProviderCallError::PossiblySent(CoreError::Network(
+                    error.to_string(),
+                )))
             }
         })?;
 
         if !response.status().is_success() {
-            return Err(BridgeError::PossiblySent(
+            return Err(Error::from(ProviderCallError::PossiblySent(
                 response_error(response, self.read_idle_timeout).await,
-            ));
+            )));
         }
 
         let status_code = response.status().as_u16();
@@ -99,7 +101,7 @@ impl HttpStreamCall {
                     .map_err(|error| CoreError::InvalidResponse(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(BridgeError::PossiblySent)?;
+            .map_err(|error| Error::from(ProviderCallError::PossiblySent(error)))?;
         let timeout = self.read_idle_timeout;
         let byte_stream = stream::unfold(response.bytes_stream(), move |mut body| async move {
             let next = match timeout {
@@ -107,9 +109,9 @@ impl HttpStreamCall {
                     Ok(next) => next,
                     Err(_) => {
                         return Some((
-                            Err(BridgeError::PossiblySent(CoreError::Network(
+                            Err(Error::from(ProviderCallError::PossiblySent(CoreError::Network(
                                 "stream response read timed out".to_string(),
-                            ))),
+                            )))),
                             body,
                         ));
                     }
@@ -119,7 +121,9 @@ impl HttpStreamCall {
             next.map(|item| {
                 (
                     item.map(|bytes| bytes.to_vec()).map_err(|error| {
-                        BridgeError::PossiblySent(CoreError::Network(error.to_string()))
+                        Error::from(ProviderCallError::PossiblySent(CoreError::Network(
+                            error.to_string(),
+                        )))
                     }),
                     body,
                 )
@@ -246,8 +250,7 @@ fn open_http_stream(
         body,
         open_timeout_seconds,
         read_idle_timeout_seconds,
-    )
-    .map_err(BridgeError::into_pyerr)?;
+    )?;
     run_sync_with(py, call.run(), |py, opened| {
         Ok(Py::new(py, HttpResponseStream::from(opened))?.into_any())
     })
@@ -273,8 +276,7 @@ fn aopen_http_stream(
         body,
         open_timeout_seconds,
         read_idle_timeout_seconds,
-    )
-    .map_err(BridgeError::into_pyerr)?;
+    )?;
     run_async_with(py, call.run(), |py, opened| {
         Ok(Py::new(py, HttpResponseStream::from(opened))?.into_any())
     })
@@ -381,7 +383,9 @@ mod tests {
         });
         assert!(matches!(
             call(open_url, Some(Duration::from_millis(20)), None).run().await,
-            Err(BridgeError::PossiblySent(CoreError::Network(message)))
+            Err(Error::ProviderCall(ProviderCallError::PossiblySent(
+                CoreError::Network(message)
+            )))
                 if message == "stream response open timed out"
         ));
         open_server.join().expect("open timeout server");
@@ -399,7 +403,9 @@ mod tests {
             .expect("stream opens");
         assert!(matches!(
             opened.receiver.next().await,
-            Err(BridgeError::PossiblySent(CoreError::Network(message)))
+            Err(Error::ProviderCall(ProviderCallError::PossiblySent(
+                CoreError::Network(message)
+            )))
                 if message == "stream response read timed out"
         ));
         read_server.join().expect("read timeout server");
@@ -423,7 +429,10 @@ mod tests {
         };
         assert!(matches!(
             error,
-            BridgeError::PossiblySent(CoreError::Http { status: 429, body })
+            Error::ProviderCall(ProviderCallError::PossiblySent(CoreError::Http {
+                status: 429,
+                body,
+            }))
                 if body.len() <= ERROR_BODY_LIMIT_BYTES
         ));
         server.join().expect("server task");

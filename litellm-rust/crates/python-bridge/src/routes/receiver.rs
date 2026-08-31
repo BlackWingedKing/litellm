@@ -6,7 +6,7 @@ use litellm_core::error::CoreError;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::errors::{BridgeError, BridgeResult};
+use crate::errors::{BridgeResult, Error};
 
 const BRIDGE_CHANNEL_CAPACITY: usize = 1;
 
@@ -70,7 +70,7 @@ impl<T: Send + 'static> BridgeReceiver<T> {
             return Ok(None);
         }
         if self.state.reading.swap(true, Ordering::AcqRel) {
-            return Err(BridgeError::Core(CoreError::InvalidRequest(
+            return Err(Error::Core(CoreError::InvalidRequest(
                 "native stream does not support concurrent reads".to_string(),
             )));
         }
@@ -115,14 +115,14 @@ mod tests {
     async fn receiver_preserves_items_and_terminal_error() {
         let receiver = BridgeReceiver::from_stream(stream::iter([
             Ok(vec![1_u8]),
-            Err(BridgeError::Core(CoreError::Network("broken".to_string()))),
+            Err(Error::Core(CoreError::Network("broken".to_string()))),
             Ok(vec![2_u8]),
         ]));
 
         assert_eq!(receiver.next().await.expect("first item"), Some(vec![1]));
         assert!(matches!(
             receiver.next().await,
-            Err(BridgeError::Core(CoreError::Network(message))) if message == "broken"
+            Err(Error::Core(CoreError::Network(message))) if message == "broken"
         ));
         assert_eq!(receiver.next().await.expect("closed after error"), None);
     }
@@ -175,7 +175,7 @@ mod tests {
 
         assert!(matches!(
             receiver.next().await,
-            Err(BridgeError::Core(CoreError::InvalidRequest(message)))
+            Err(Error::Core(CoreError::InvalidRequest(message)))
                 if message == "native stream does not support concurrent reads"
         ));
         receiver.close();

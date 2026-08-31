@@ -1,7 +1,6 @@
 use litellm_core::error::{CoreError, ProviderCallError};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use thiserror::Error;
 
 pyo3::create_exception!(
     _native,
@@ -17,10 +16,10 @@ pyo3::create_exception!(
     "The request may have reached the provider, so retrying is unsafe. Args are (status, message); status is 0 when there was no HTTP response."
 );
 
-pub(crate) type BridgeResult<T> = Result<T, BridgeError>;
+pub(crate) type BridgeResult<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Error)]
-pub(crate) enum BridgeError {
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
     #[error(transparent)]
     Python(#[from] PyErr),
     #[error(transparent)]
@@ -31,7 +30,7 @@ pub(crate) enum BridgeError {
     Declined(String),
 }
 
-impl BridgeError {
+impl Error {
     pub(crate) fn declined(error: impl std::fmt::Display) -> Self {
         Self::Declined(error.to_string())
     }
@@ -57,18 +56,18 @@ fn upstream_error_to_pyerr(error: CoreError) -> PyErr {
     }
 }
 
-impl From<BridgeError> for PyErr {
-    fn from(error: BridgeError) -> Self {
+impl From<Error> for PyErr {
+    fn from(error: Error) -> Self {
         match error {
-            BridgeError::Python(error) => error,
-            BridgeError::Core(error) => core_error_to_pyerr(error),
-            BridgeError::ProviderCall(ProviderCallError::NotSent(error)) => {
+            Error::Python(error) => error,
+            Error::Core(error) => core_error_to_pyerr(error),
+            Error::ProviderCall(ProviderCallError::NotSent(error)) => {
                 RustBridgeDeclined::new_err(error.to_string())
             }
-            BridgeError::ProviderCall(ProviderCallError::PossiblySent(error)) => {
+            Error::ProviderCall(ProviderCallError::PossiblySent(error)) => {
                 upstream_error_to_pyerr(error)
             }
-            BridgeError::Declined(reason) => RustBridgeDeclined::new_err(reason),
+            Error::Declined(reason) => RustBridgeDeclined::new_err(reason),
         }
     }
 }
@@ -85,13 +84,13 @@ mod tests {
 
     #[test]
     fn provider_lifecycle_errors_remain_typed_until_the_python_boundary() {
-        let error = BridgeError::from(ProviderCallError::NotSent(CoreError::Unsupported(
+        let error = Error::from(ProviderCallError::NotSent(CoreError::Unsupported(
             "streaming",
         )));
 
         assert!(matches!(
             error,
-            BridgeError::ProviderCall(ProviderCallError::NotSent(CoreError::Unsupported(
+            Error::ProviderCall(ProviderCallError::NotSent(CoreError::Unsupported(
                 "streaming"
             )))
         ));
@@ -101,10 +100,10 @@ mod tests {
     fn provider_lifecycle_errors_map_to_distinct_python_exceptions() {
         Python::initialize();
         Python::attach(|py| {
-            let declined = PyErr::from(BridgeError::from(ProviderCallError::NotSent(
+            let declined = PyErr::from(Error::from(ProviderCallError::NotSent(
                 CoreError::Unsupported("streaming"),
             )));
-            let possibly_sent = PyErr::from(BridgeError::from(ProviderCallError::PossiblySent(
+            let possibly_sent = PyErr::from(Error::from(ProviderCallError::PossiblySent(
                 CoreError::InvalidResponse("bad body".to_string()),
             )));
 
@@ -135,7 +134,7 @@ mod tests {
     fn upstream_http_error_preserves_status_and_message() {
         Python::initialize();
         Python::attach(|py| {
-            let error = PyErr::from(BridgeError::from(ProviderCallError::PossiblySent(
+            let error = PyErr::from(Error::from(ProviderCallError::PossiblySent(
                 CoreError::Http {
                     status: 429,
                     body: "rate limited".to_string(),

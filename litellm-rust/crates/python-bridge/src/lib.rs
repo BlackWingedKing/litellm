@@ -5,6 +5,8 @@ mod routes;
 
 use pyo3::prelude::*;
 
+pub use errors::Error;
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(module)?;

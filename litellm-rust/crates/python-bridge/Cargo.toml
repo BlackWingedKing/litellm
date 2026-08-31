@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "_native"
-crate-type = ["cdylib"]
+name = "litellm_python_bridge"
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["abi3"]
