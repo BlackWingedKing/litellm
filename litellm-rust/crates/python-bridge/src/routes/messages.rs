@@ -6,7 +6,6 @@ use serde_json::Value;
 
 use crate::errors::core_error_to_pyerr;
 use crate::marshal::{RouteOptions, required_value};
-use crate::route::bridge_route;
 
 struct MessagesCall {
     options: RouteOptions,

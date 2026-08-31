@@ -6,7 +6,6 @@ use serde_json::{Map, Value};
 
 use crate::errors::core_error_to_pyerr;
 use crate::marshal::{RouteOptions, object_or_empty};
-use crate::route::bridge_route;
 
 struct OcrCall {
     options: RouteOptions,

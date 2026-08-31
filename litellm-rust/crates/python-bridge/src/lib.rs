@@ -2,7 +2,6 @@ mod diagnostics;
 mod errors;
 mod marshal;
 mod responses_websocket;
-mod route;
 mod routes;
 
 use pyo3::prelude::*;

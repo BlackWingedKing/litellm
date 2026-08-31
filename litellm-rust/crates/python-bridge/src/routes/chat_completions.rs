@@ -9,7 +9,6 @@ use serde_json::{Map, Value};
 
 use crate::errors::fallback_error_to_pyerr;
 use crate::marshal::{RouteOptions, object_or_empty, required_value};
-use crate::route::bridge_route;
 
 struct ChatCompletionsCall {
     options: RouteOptions,
