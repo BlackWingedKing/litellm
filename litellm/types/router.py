@@ -357,6 +357,16 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
 
     # Vector Store Params
     vector_store_id: str | None = None
+    milvus_transport: object | None = Field(
+        default=None,
+        json_schema_extra={  # mutable-ok: Pydantic requires mutable JSON schema metadata
+            "type": "string",
+            "enum": [  # mutable-ok: Pydantic requires list-valued enum metadata
+                "rest",
+                "grpc",
+            ],
+        },
+    )
     milvus_text_field: str | None = None
     milvus_db_name: str | None = None
     milvus_partition_names: list[str] | None = None
@@ -366,6 +376,13 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     valkey_ssl: bool | None = None
     valkey_text_field: str | None = None
     valkey_embedding_field: str | None = None
+
+    @field_validator("milvus_transport")
+    @classmethod
+    def validate_milvus_transport(cls, value: object | None) -> Literal["rest", "grpc"] | None:
+        if value not in (None, "rest", "grpc"):
+            raise ValueError("milvus_transport must be either 'rest' or 'grpc'")
+        return value
 
     @model_validator(mode="before")
     @classmethod

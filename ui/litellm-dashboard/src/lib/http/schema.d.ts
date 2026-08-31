@@ -29084,6 +29084,11 @@ export interface components {
             milvus_partition_names?: string[] | null;
             /** Milvus Text Field */
             milvus_text_field?: string | null;
+            /**
+             * Milvus Transport
+             * @enum {string}
+             */
+            milvus_transport?: "rest" | "grpc";
             /** Mock Response */
             mock_response?: string | components["schemas"]["ModelResponse"] | unknown | null;
             /** Model */
@@ -38865,6 +38870,11 @@ export interface components {
             milvus_partition_names?: string[] | null;
             /** Milvus Text Field */
             milvus_text_field?: string | null;
+            /**
+             * Milvus Transport
+             * @enum {string}
+             */
+            milvus_transport?: "rest" | "grpc";
             /** Mock Response */
             mock_response?: string | components["schemas"]["ModelResponse"] | unknown | null;
             /** Model */
