@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import ssl
 from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -89,6 +88,7 @@ from litellm.responses.streaming_iterator import (
     ResponsesWebSocketStreaming,
     SyncResponsesAPIStreamingIterator,
 )
+from litellm.rust_bridge.runtime import CoreEngine, execution_hidden_params
 from litellm.types.containers.main import (
     ContainerFileListResponse,
     ContainerListResponse,
@@ -159,7 +159,13 @@ def _rust_responses_websocket_enabled(
     custom_llm_provider: str | None,
     litellm_params: GenericLiteLLMParams,
 ) -> bool:
-    if custom_llm_provider != "openai" or litellm_params.get("rust") is not True:
+    if custom_llm_provider != "openai":
+        return False
+    from litellm.rust_bridge.configuration import rust_enabled
+
+    raw_request_override: Final = litellm_params.get("rust")
+    request_override: Final = raw_request_override if isinstance(raw_request_override, bool) else None
+    if not rust_enabled(request_override=request_override):
         return False
     from litellm.rust_bridge.streaming import supports_streaming
 
@@ -233,6 +239,23 @@ def _google_genai_streaming_hidden_params(
         "response_cost": "",
         "additional_headers": process_response_headers(response_headers),
     }
+
+
+def _anthropic_messages_with_core_engine(
+    response: AnthropicMessagesResponse,
+    source: CoreEngine,
+) -> AnthropicMessagesResponse:
+    existing_hidden_params: Final = response.get("_hidden_params")
+    return cast(  # cast-ok: TypedDict constructors cannot preserve copied hidden metadata
+        AnthropicMessagesResponse,
+        {  # mutable-ok: Anthropic SDK responses remain dict-backed
+            **response,
+            "_hidden_params": execution_hidden_params(
+                existing_hidden_params if isinstance(existing_hidden_params, dict) else None,
+                source,
+            ),
+        },
+    )
 
 
 @lru_cache(maxsize=None)
@@ -2361,15 +2384,24 @@ class BaseLLMHTTPHandler:
             kwargs=kwargs_for_agentic,
         )
 
-        return self._maybe_wrap_in_fake_stream(
+        selected_response: Final = cast(  # cast-ok: agentic hooks preserve the Anthropic response contract
+            AnthropicMessagesResponse,
             final_response if final_response is not None else initial_response,
+        )
+        existing_hidden_params: Final = selected_response.get("_hidden_params")
+        existing_source: Final = (
+            existing_hidden_params.get("core_engine") if isinstance(existing_hidden_params, dict) else None
+        )
+        source: Final = CoreEngine.RUST if existing_source == CoreEngine.RUST.value else CoreEngine.PYTHON
+        response_with_provenance: Final = _anthropic_messages_with_core_engine(
+            selected_response,
+            source,
+        )
+        return self._maybe_wrap_in_fake_stream(
+            response_with_provenance,
             logging_obj,
             "anthropic_messages",
         )
-
-    @staticmethod
-    def _rust_env_enabled() -> bool:
-        return os.getenv("LITELLM_RUST", "").strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     async def _maybe_rust_anthropic_messages(
@@ -2386,7 +2418,11 @@ class BaseLLMHTTPHandler:
     ) -> AnthropicMessagesResponse | None:
         if custom_llm_provider not in ("azure_ai", "anthropic"):
             return None
-        if litellm_params.get("rust") is not True and not BaseLLMHTTPHandler._rust_env_enabled():
+        from litellm.rust_bridge.configuration import rust_enabled
+
+        raw_request_override: Final = litellm_params.get("rust")
+        request_override: Final = raw_request_override if isinstance(raw_request_override, bool) else None
+        if not rust_enabled(request_override=request_override):
             return None
         if has_agentic_hook:
             return None
@@ -2394,28 +2430,20 @@ class BaseLLMHTTPHandler:
         from litellm.rust_bridge import messages as rust_messages_bridge
 
         upstream_body: Final = {key: value for key, value in request_body.items() if key != "stream"}
-        try:
-            rust_response: Final = await rust_messages_bridge.amessages(
-                model=model,
-                body=upstream_body,
-                api_key=api_key,
-                api_base=api_base,
-                custom_llm_provider=custom_llm_provider,
-                extra_headers=headers,
-                timeout=timeout,
-            )
-        except Exception as rust_error:  # noqa: BLE001  # rollout-safety fallback: any Rust bridge failure must fall back to the Python path
-            verbose_logger.debug(
-                "Rust Anthropic messages bridge raised %s; falling back to Python path",
-                type(rust_error).__name__,
-            )
-            return None
+        rust_response: Final = await rust_messages_bridge.amessages(
+            model=model,
+            body=upstream_body,
+            api_key=api_key,
+            api_base=api_base,
+            custom_llm_provider=custom_llm_provider,
+            extra_headers=headers,
+            timeout=timeout,
+        )
         if rust_response is None:
             return None
 
         response_obj: Final = cast(AnthropicMessagesResponse, dict(rust_response))
-        response_obj["_hidden_params"] = {"additional_headers": {"x-litellm-rust": "true"}}
-        return response_obj
+        return _anthropic_messages_with_core_engine(response_obj, CoreEngine.RUST)
 
     @staticmethod
     def _rust_anthropic_messages_fake_stream(
@@ -2428,9 +2456,13 @@ class BaseLLMHTTPHandler:
             AnthropicMessagesStreamHiddenParams,
             AnthropicMessagesStreamingResponse,
         )
+        from litellm.rust_bridge.runtime import CoreEngine, execution_additional_headers
 
         completion_stream = cast(AsyncIterator[bytes], FakeAnthropicMessagesStreamIterator(response=rust_response))
-        hidden_params: Final = AnthropicMessagesStreamHiddenParams(additional_headers={"x-litellm-rust": "true"})
+        hidden_params: Final = AnthropicMessagesStreamHiddenParams(
+            additional_headers=execution_additional_headers(None, CoreEngine.RUST),
+            core_engine=CoreEngine.RUST.value,
+        )
         return AnthropicMessagesStreamingResponse(
             completion_stream=completion_stream,
             hidden_params=hidden_params,
@@ -6489,7 +6521,7 @@ class BaseLLMHTTPHandler:
                 if _rust_responses_websocket_enabled(custom_llm_provider, litellm_params):
                     from litellm.rust_bridge import responses_websocket as rust_responses_websocket
 
-                    rust_backend: Final = await rust_responses_websocket.connect(
+                    rust_execution: Final = await rust_responses_websocket.connect(
                         provider=custom_llm_provider,
                         api_key=api_key,
                         api_base=api_base,
@@ -6497,6 +6529,7 @@ class BaseLLMHTTPHandler:
                         timeout=timeout,
                         litellm_metadata=litellm_metadata,
                     )
+                    rust_backend: Final = rust_execution.value
                     if rust_backend is not None:
                         yield rust_backend
                         return

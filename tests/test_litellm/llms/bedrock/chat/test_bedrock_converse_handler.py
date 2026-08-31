@@ -15,6 +15,7 @@ from botocore.credentials import Credentials
 from litellm.llms.bedrock.chat.converse_handler import BedrockConverseLLM
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.rust_bridge import chat_completions as bridge
+from litellm.rust_bridge import runtime as bridge_runtime
 from litellm.types.utils import ModelResponse
 
 RUST_RESPONSE = {
@@ -114,7 +115,11 @@ def test_rust_true_serves_the_call_and_stamps_the_header():
     response = _run()
 
     assert response.choices[0].message.content == "hello from rust"
-    assert response._hidden_params["additional_headers"] == {"x-litellm-rust": "true"}
+    assert response._hidden_params["core_engine"] == "rust"
+    assert response._hidden_params["additional_headers"] == {
+        "x-litellm-core": "rust",
+        "x-litellm-rust": "true",
+    }
     assert len(seen["call"]) == 1
 
 
@@ -191,7 +196,7 @@ async def test_the_async_path_falls_back_when_the_core_declines(monkeypatch):
         RustBridgeDeclined = _Declined
         RustUpstreamError = type("_Upstream", (Exception,), {})
 
-    monkeypatch.setattr(bridge, "get_native_bridge", lambda: _FakeNative())
+    monkeypatch.setattr(bridge_runtime, "get_native_bridge", lambda: _FakeNative())
 
     async def declining_native(**_kwargs):
         raise _Declined("blank message text")
@@ -237,7 +242,11 @@ async def test_the_async_path_serves_the_rust_response_without_the_fallback():
         )
 
     assert result.choices[0].message.content == "hello from rust"
-    assert result._hidden_params["additional_headers"] == {"x-litellm-rust": "true"}
+    assert result._hidden_params["core_engine"] == "rust"
+    assert result._hidden_params["additional_headers"] == {
+        "x-litellm-core": "rust",
+        "x-litellm-rust": "true",
+    }
     assert not python_call.called
 
 
@@ -264,7 +273,7 @@ async def test_pre_call_logging_fires_once_even_when_the_rust_path_declines():
         return ModelResponse()
 
     with (
-        patch.object(bridge, "get_native_bridge", lambda: _FakeNative()),
+        patch.object(bridge_runtime, "get_native_bridge", lambda: _FakeNative()),
         patch.object(
             BedrockConverseLLM, "get_credentials", return_value=RESOLVED_CREDENTIALS
         ),
@@ -369,7 +378,7 @@ def test_pre_call_logging_fires_once_when_the_sync_rust_path_declines():
 
     logging_obj = MagicMock()
 
-    with patch.object(bridge, "get_native_bridge", lambda: _FakeNative()):
+    with patch.object(bridge_runtime, "get_native_bridge", lambda: _FakeNative()):
         bridge.set_rust_chat_completions(chat_completions=declining_native)
         response = _run(
             logging_obj=logging_obj,
@@ -450,7 +459,7 @@ def test_post_call_is_not_logged_twice_when_the_sync_rust_call_declines():
 
     logging_obj, calls = _recording_logging_obj()
 
-    with patch.object(bridge, "get_native_bridge", lambda: _FakeNative()):
+    with patch.object(bridge_runtime, "get_native_bridge", lambda: _FakeNative()):
         bridge.set_rust_chat_completions(chat_completions=declining_native)
         response = _run(
             logging_obj=logging_obj,

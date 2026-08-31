@@ -10,21 +10,31 @@ fallback, which runs only when the native route guarantees it sent nothing.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
 from litellm._logging import verbose_logger
-from litellm.exceptions import APIError
 from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
     convert_to_model_response_object,
 )
 from litellm.llms.bedrock.request_metadata import bedrock_request_metadata_is_owned
-from litellm.rust_bridge.loader import get_native_bridge
+from litellm.rust_bridge.configuration import rust_enabled
+from litellm.rust_bridge.runtime import (
+    LEGACY_RUST_HEADER,
+    UNSET,
+    BridgeContext,
+    CoreEngine,
+    ExecutionResult,
+    FallbackMode,
+    NativeBinding,
+    Unset,
+    ainvoke,
+    execution_hidden_params,
+    invoke,
+)
 from litellm.rust_bridge.timeouts import timeout_to_seconds
 from litellm.types.utils import ModelResponse
 
@@ -39,9 +49,7 @@ RUST_CHAT_COMPLETIONS_PROVIDERS: Final = frozenset({"anthropic", "bedrock"})
 # rather than narrowing an unparameterized `Mapping` and typing the result Any.
 _LITELLM_METADATA_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 
-RUST_RESPONSE_HEADER: Final = "x-litellm-rust"
-
-_TRUTHY_ENV_VALUES: Final = frozenset({"1", "true", "yes", "on"})
+RUST_RESPONSE_HEADER: Final = LEGACY_RUST_HEADER
 
 
 class RustChatCompletions(Protocol):
@@ -114,57 +122,27 @@ def response_logger(
     return log
 
 
-class _Unset:
-    pass
-
-
-_UNSET: Final[_Unset] = _Unset()
-
-
-@dataclass(slots=True)
-class _RustChatCompletionsState:
-    chat_completions: RustChatCompletions | None = None
-    achat_completions: RustAchatCompletions | None = None
-
-
-_STATE: Final[_RustChatCompletionsState] = _RustChatCompletionsState()
+_CHAT_COMPLETIONS: Final = NativeBinding[RustChatCompletions]("chat_completions")
+_ACHAT_COMPLETIONS: Final = NativeBinding[RustAchatCompletions]("achat_completions")
 
 
 def set_rust_chat_completions(
     *,
-    chat_completions: RustChatCompletions | None | _Unset = _UNSET,
-    achat_completions: RustAchatCompletions | None | _Unset = _UNSET,
+    chat_completions: RustChatCompletions | None | Unset = UNSET,
+    achat_completions: RustAchatCompletions | None | Unset = UNSET,
 ) -> None:
     """Inject the native callables, so tests can supply a double instead of
     patching module attributes."""
-    if not isinstance(chat_completions, _Unset):
-        _STATE.chat_completions = chat_completions
-    if not isinstance(achat_completions, _Unset):
-        _STATE.achat_completions = achat_completions
+    _CHAT_COMPLETIONS.update(chat_completions)
+    _ACHAT_COMPLETIONS.update(achat_completions)
 
 
 def load_rust_chat_completions() -> RustChatCompletions | None:
-    if _STATE.chat_completions is not None:
-        return _STATE.chat_completions
-    native_bridge: Final = get_native_bridge()
-    if native_bridge is None:
-        return None
-    loaded: RustChatCompletions | None = getattr(native_bridge, "chat_completions", None)
-    return loaded
+    return _CHAT_COMPLETIONS.load()
 
 
 def load_rust_achat_completions() -> RustAchatCompletions | None:
-    if _STATE.achat_completions is not None:
-        return _STATE.achat_completions
-    native_bridge: Final = get_native_bridge()
-    if native_bridge is None:
-        return None
-    loaded: RustAchatCompletions | None = getattr(native_bridge, "achat_completions", None)
-    return loaded
-
-
-def _env_enables_rust() -> bool:
-    return os.getenv("LITELLM_RUST", "").strip().lower() in _TRUTHY_ENV_VALUES
+    return _ACHAT_COMPLETIONS.load()
 
 
 def _anthropic_user_id_reaches_the_body(litellm_params: Mapping[str, object] | None) -> bool:
@@ -216,54 +194,15 @@ def should_attempt_rust_chat_completions(
         return False
     if stream:
         return False
-    opted_in: Final = litellm_params is not None and litellm_params.get("rust") is True
-    if not opted_in and not _env_enables_rust():
+    raw_request_override: Final = None if litellm_params is None else litellm_params.get("rust")
+    request_override: Final = raw_request_override if isinstance(raw_request_override, bool) else None
+    if not rust_enabled(request_override=request_override):
         return False
     if _litellm_metadata_reaches_the_provider(custom_llm_provider, litellm_params):
         verbose_logger.debug("Rust chat completions skipped because Python owns provider metadata")
         return False
     native_call: Final = load_rust_achat_completions() if asynchronous else load_rust_chat_completions()
     return native_call is not None
-
-
-def _rust_bridge_exceptions() -> tuple[type[BaseException], type[BaseException]] | None:
-    """`(declined, upstream_failed)` from the native module, or None when absent."""
-    native_bridge: Final = get_native_bridge()
-    if native_bridge is None:
-        return None
-    declined: Final = getattr(native_bridge, "RustBridgeDeclined", None)
-    upstream: Final = getattr(native_bridge, "RustUpstreamError", None)
-    if declined is None or upstream is None:
-        return None
-    return declined, upstream
-
-
-def _raise_unless_declined(
-    rust_error: BaseException,
-    *,
-    model: str,
-    custom_llm_provider: str | None,
-) -> None:
-    exceptions: Final = _rust_bridge_exceptions()
-    if exceptions is None:
-        raise rust_error
-    declined, upstream_failed = exceptions
-    if isinstance(rust_error, upstream_failed):
-        args: Final = rust_error.args
-        status: Final = args[0] if args else 0
-        message: Final = args[1] if len(args) > 1 else ""
-        raise APIError(
-            status_code=int(status) or 500,
-            message=f"litellm rust chat completions: {message}",
-            llm_provider=custom_llm_provider or "",
-            model=model,
-        )
-    if not isinstance(rust_error, declined):
-        raise rust_error
-    verbose_logger.debug(
-        "Rust chat completions declined before calling the provider (%s); using the Python path",
-        rust_error,
-    )
 
 
 def _build_model_response(
@@ -273,11 +212,32 @@ def _build_model_response(
     built: Final = convert_to_model_response_object(
         response_object=dict(rust_response),  # mutable-ok: the converter takes a real dict and rewrites it
         model_response_object=model_response,
-        hidden_params={"additional_headers": {RUST_RESPONSE_HEADER: "true"}},  # mutable-ok: rewritten by the converter
+        hidden_params=execution_hidden_params(None, CoreEngine.RUST),  # mutable-ok: rewritten by the converter
     )
     if not isinstance(built, ModelResponse):
         raise TypeError(f"expected a ModelResponse from the rust path, got {type(built).__name__}")
     return built
+
+
+def _unwrap_execution(result: ExecutionResult[object]) -> object:
+    value: Final = result.value
+    if isinstance(value, ModelResponse):
+        raw_hidden_params: Final = cast(  # cast-ok: SDK private metadata is untyped
+            object,
+            value._hidden_params,  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # SDK metadata is private
+        )
+        hidden_params: Final = (
+            cast(  # cast-ok: runtime Mapping validation narrows the private SDK metadata
+                Mapping[str, object], raw_hidden_params
+            )
+            if isinstance(raw_hidden_params, Mapping)
+            else None
+        )
+        value._hidden_params = execution_hidden_params(  # pyright: ignore[reportPrivateUsage]  # preserve SDK response type
+            hidden_params,
+            result.source,
+        )
+    return value
 
 
 def chat_completions_or_fallback(
@@ -295,10 +255,10 @@ def chat_completions_or_fallback(
     python_fallback: Callable[[], object],
 ) -> object:
     rust_chat_completions: Final = load_rust_chat_completions()
-    if rust_chat_completions is None:
-        return python_fallback()
-    try:
-        rust_response: Final = rust_chat_completions(
+    native_call: Final = (
+        None
+        if rust_chat_completions is None
+        else lambda: rust_chat_completions(
             model=model,
             messages=messages,
             optional_params=optional_params,
@@ -308,11 +268,25 @@ def chat_completions_or_fallback(
             extra_headers=extra_headers,
             timeout_seconds=timeout_to_seconds(timeout),
         )
-    except Exception as rust_error:  # noqa: BLE001  # native exception classes define whether fallback is safe
-        _raise_unless_declined(rust_error, model=model, custom_llm_provider=custom_llm_provider)
-        return python_fallback()
-    on_response(rust_response)
-    return _build_model_response(rust_response, model_response)
+    )
+
+    def adapt(rust_response: Mapping[str, object]) -> object:
+        on_response(rust_response)
+        return _build_model_response(rust_response, model_response)
+
+    return _unwrap_execution(
+        invoke(
+            native_call=native_call,
+            fallback=python_fallback,
+            adapt=adapt,
+            mode=FallbackMode.PYTHON,
+            context=BridgeContext(
+                route="chat completions",
+                provider=custom_llm_provider or "",
+                model=model,
+            ),
+        )
+    )
 
 
 async def achat_completions_or_fallback(
@@ -330,10 +304,10 @@ async def achat_completions_or_fallback(
     python_fallback: Callable[[], Awaitable[object]],
 ) -> object:
     rust_achat_completions: Final = load_rust_achat_completions()
-    if rust_achat_completions is None:
-        return await python_fallback()
-    try:
-        rust_response: Final = await rust_achat_completions(
+    native_call: Final = (
+        None
+        if rust_achat_completions is None
+        else lambda: rust_achat_completions(
             model=model,
             messages=messages,
             optional_params=optional_params,
@@ -343,8 +317,22 @@ async def achat_completions_or_fallback(
             extra_headers=extra_headers,
             timeout_seconds=timeout_to_seconds(timeout),
         )
-    except Exception as rust_error:  # noqa: BLE001  # native exception classes define whether fallback is safe
-        _raise_unless_declined(rust_error, model=model, custom_llm_provider=custom_llm_provider)
-        return await python_fallback()
-    on_response(rust_response)
-    return _build_model_response(rust_response, model_response)
+    )
+
+    def adapt(rust_response: Mapping[str, object]) -> object:
+        on_response(rust_response)
+        return _build_model_response(rust_response, model_response)
+
+    return _unwrap_execution(
+        await ainvoke(
+            native_call=native_call,
+            fallback=python_fallback,
+            adapt=adapt,
+            mode=FallbackMode.PYTHON,
+            context=BridgeContext(
+                route="chat completions",
+                provider=custom_llm_provider or "",
+                model=model,
+            ),
+        )
+    )

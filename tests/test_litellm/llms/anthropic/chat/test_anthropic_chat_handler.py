@@ -8,6 +8,7 @@ import pytest
 import litellm
 from litellm.constants import RESPONSE_FORMAT_TOOL_NAME
 from litellm.llms.anthropic.chat.handler import ModelResponseIterator, make_call
+from litellm.rust_bridge import runtime as bridge_runtime
 from litellm.types.llms.openai import (
     ChatCompletionToolCallChunk,
     ChatCompletionToolCallFunctionChunk,
@@ -2282,7 +2283,11 @@ class TestRustChatCompletionsHook:
         response = AnthropicChatCompletion().completion(**self._completion_kwargs())
 
         assert response.choices[0].message.content == "hello from rust"
-        assert response._hidden_params["additional_headers"] == {"x-litellm-rust": "true"}
+        assert response._hidden_params["core_engine"] == "rust"
+        assert response._hidden_params["additional_headers"] == {
+            "x-litellm-core": "rust",
+            "x-litellm-rust": "true",
+        }
         assert len(seen["call"]) == 1
 
     def test_the_core_receives_the_untranslated_openai_messages(self):
@@ -2407,7 +2412,7 @@ class TestRustChatCompletionsHook:
         def declining_native(**_kwargs):
             raise _Declined("blank message text")
 
-        monkeypatch.setattr(bridge, "get_native_bridge", lambda: _FakeNative())
+        monkeypatch.setattr(bridge_runtime, "get_native_bridge", lambda: _FakeNative())
         bridge.set_rust_chat_completions(chat_completions=declining_native)
 
         logging_obj, calls = self._recording_logging_obj()
@@ -2437,7 +2442,7 @@ class TestRustChatCompletionsHook:
             RustBridgeDeclined = _Declined
             RustUpstreamError = type("_Upstream", (Exception,), {})
 
-        monkeypatch.setattr(bridge, "get_native_bridge", lambda: _FakeNative())
+        monkeypatch.setattr(bridge_runtime, "get_native_bridge", lambda: _FakeNative())
 
         async def declining_native(**_kwargs):
             raise _Declined("blank message text")
@@ -2475,7 +2480,11 @@ class TestRustChatCompletionsHook:
             )
 
         assert result.choices[0].message.content == "hello from rust"
-        assert result._hidden_params["additional_headers"] == {"x-litellm-rust": "true"}
+        assert result._hidden_params["core_engine"] == "rust"
+        assert result._hidden_params["additional_headers"] == {
+            "x-litellm-core": "rust",
+            "x-litellm-rust": "true",
+        }
         assert not python_call.called
 
 
@@ -2493,7 +2502,7 @@ class TestRustChatCompletionsHook:
             RustBridgeDeclined = _Declined
             RustUpstreamError = type("_Upstream", (Exception,), {})
 
-        monkeypatch.setattr(bridge, "get_native_bridge", lambda: _FakeNative())
+        monkeypatch.setattr(bridge_runtime, "get_native_bridge", lambda: _FakeNative())
 
         def declining_native(**_kwargs):
             raise _Declined("blank message text")
