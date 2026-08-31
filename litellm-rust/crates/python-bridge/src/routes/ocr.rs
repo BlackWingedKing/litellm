@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::errors::core_error_to_pyerr;
 use crate::marshal::{RouteOptions, object_or_empty};
+use crate::routes::BridgeRoute;
 
 struct OcrCall {
     options: RouteOptions,
@@ -13,7 +14,9 @@ struct OcrCall {
     optional_params: Map<String, Value>,
 }
 
-impl OcrCall {
+impl BridgeRoute<OcrInputs> for OcrCall {
+    type Output = Value;
+
     fn from_python(py: Python<'_>, inputs: OcrInputs) -> PyResult<Self> {
         Ok(Self {
             options: RouteOptions::from_python(
@@ -73,6 +76,6 @@ bridge_route! {
         optional_params: Option<Py<PyAny>>,
         timeout_seconds: Option<f64>,
     },
-    prepare = OcrCall::from_python,
+    call = OcrCall,
     errors = core_error_to_pyerr,
 }

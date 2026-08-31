@@ -6,13 +6,16 @@ use serde_json::Value;
 
 use crate::errors::core_error_to_pyerr;
 use crate::marshal::{RouteOptions, required_value};
+use crate::routes::BridgeRoute;
 
 struct MessagesCall {
     options: RouteOptions,
     body: Value,
 }
 
-impl MessagesCall {
+impl BridgeRoute<MessagesInputs> for MessagesCall {
+    type Output = AnthropicMessagesResponse;
+
     fn from_python(py: Python<'_>, inputs: MessagesInputs) -> PyResult<Self> {
         Ok(Self {
             options: RouteOptions::from_python(
@@ -65,6 +68,6 @@ bridge_route! {
         extra_headers: Option<Py<PyAny>>,
         timeout_seconds: Option<f64>,
     },
-    prepare = MessagesCall::from_python,
+    call = MessagesCall,
     errors = core_error_to_pyerr,
 }

@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::errors::core_error_to_pyerr;
 use crate::marshal::{RouteOptions, object_or_empty};
+use crate::routes::BridgeRoute;
 
 struct AudioTranscriptionCall {
     options: RouteOptions,
@@ -15,7 +16,9 @@ struct AudioTranscriptionCall {
     optional_params: Map<String, Value>,
 }
 
-impl AudioTranscriptionCall {
+impl BridgeRoute<AudioTranscriptionInputs> for AudioTranscriptionCall {
+    type Output = Value;
+
     fn from_python(py: Python<'_>, inputs: AudioTranscriptionInputs) -> PyResult<Self> {
         Ok(Self {
             options: RouteOptions::from_python(
@@ -75,6 +78,6 @@ bridge_route! {
         optional_params: Option<Py<PyAny>>,
         timeout_seconds: Option<f64>,
     },
-    prepare = AudioTranscriptionCall::from_python,
+    call = AudioTranscriptionCall,
     errors = core_error_to_pyerr,
 }

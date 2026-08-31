@@ -7,6 +7,14 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use serde::Serialize;
 
+trait BridgeRoute<I>: Sized {
+    type Output: Serialize + Send + 'static;
+
+    fn from_python(py: Python<'_>, inputs: I) -> PyResult<Self>;
+
+    fn run(self) -> impl Future<Output = CoreResult<Self::Output>> + Send + 'static;
+}
+
 fn run_sync<T, F>(
     py: Python<'_>,
     future: F,
@@ -48,7 +56,7 @@ macro_rules! bridge_route {
         inputs = $inputs:ident,
         required = { $($required_name:ident: $required_type:ty),* $(,)? },
         optional = { $($optional_name:ident: $optional_type:ty),* $(,)? },
-        prepare = $prepare:path,
+        call = $call:ty,
         errors = $map_error:path
         $(, extra = [$($extra:ident),* $(,)?])?
         $(,)?
@@ -66,11 +74,15 @@ macro_rules! bridge_route {
             $($required_name: $required_type,)*
             $($optional_name: $optional_type),*
         ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-            let call = $prepare(py, $inputs {
+            let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
             })?;
-            crate::routes::run_sync(py, call.run(), $map_error)
+            crate::routes::run_sync(
+                py,
+                <$call as crate::routes::BridgeRoute<$inputs>>::run(call),
+                $map_error,
+            )
         }
 
         #[pyfunction]
@@ -81,11 +93,15 @@ macro_rules! bridge_route {
             $($required_name: $required_type,)*
             $($optional_name: $optional_type),*
         ) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
-            let call = $prepare(py, $inputs {
+            let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
             })?;
-            crate::routes::run_async(py, call.run(), $map_error)
+            crate::routes::run_async(
+                py,
+                <$call as crate::routes::BridgeRoute<$inputs>>::run(call),
+                $map_error,
+            )
         }
 
         pub(super) fn register(

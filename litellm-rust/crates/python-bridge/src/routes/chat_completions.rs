@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::errors::fallback_error_to_pyerr;
 use crate::marshal::{RouteOptions, object_or_empty, required_value};
+use crate::routes::BridgeRoute;
 
 struct ChatCompletionsCall {
     options: RouteOptions,
@@ -16,7 +17,9 @@ struct ChatCompletionsCall {
     optional_params: Map<String, Value>,
 }
 
-impl ChatCompletionsCall {
+impl BridgeRoute<ChatCompletionsInputs> for ChatCompletionsCall {
+    type Output = ChatCompletionsResponse;
+
     fn from_python(py: Python<'_>, inputs: ChatCompletionsInputs) -> PyResult<Self> {
         Ok(Self {
             options: RouteOptions::from_python(
@@ -92,7 +95,7 @@ bridge_route! {
         extra_headers: Option<Py<PyAny>>,
         timeout_seconds: Option<f64>,
     },
-    prepare = ChatCompletionsCall::from_python,
+    call = ChatCompletionsCall,
     errors = fallback_error_to_pyerr,
     extra = [chat_completions_decline],
 }
