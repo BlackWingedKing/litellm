@@ -26,7 +26,6 @@ from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
 )
 from litellm.rust_bridge import chat_completions as rust_chat_completions_bridge
-from litellm.rust_bridge import http_stream as rust_http_stream_bridge
 from litellm.rust_bridge.chat_completions import should_attempt_rust_chat_completions
 from litellm.types.llms.anthropic import (
     ContentBlockDelta,
@@ -77,33 +76,18 @@ async def make_call(
     logging_obj,
     timeout: float | httpx.Timeout | None,
     json_mode: bool,
-    litellm_params: Mapping[str, object] | None = None,
     speed: str | None = None,
     tool_name_reverse_map: dict[str, str] | None = None,
 ) -> tuple[Any, httpx.Headers]:
     try:
-        native_response: Final = await rust_http_stream_bridge.aopen_stream(
-            provider="anthropic",
-            litellm_params=litellm_params,
-            custom_client=client is not None,
-            method="POST",
-            url=api_base,
-            headers=headers,
-            body=data.encode("utf-8"),
-            timeout=timeout,
-        )
         resolved_client: Final = client or litellm.module_level_aclient
-        response: Final = (
-            native_response
-            if native_response is not None
-            else await resolved_client.post(
-                api_base,
-                headers=headers,
-                data=data,
-                stream=True,
-                timeout=timeout,
-                logging_obj=logging_obj,
-            )
+        response: Final = await resolved_client.post(
+            api_base,
+            headers=headers,
+            data=data,
+            stream=True,
+            timeout=timeout,
+            logging_obj=logging_obj,
         )
     except httpx.HTTPStatusError as e:
         error_headers = getattr(e, "headers", None)
@@ -150,33 +134,18 @@ def make_sync_call(
     logging_obj,
     timeout: float | httpx.Timeout | None,
     json_mode: bool,
-    litellm_params: Mapping[str, object] | None = None,
     speed: str | None = None,
     tool_name_reverse_map: dict[str, str] | None = None,
 ) -> tuple[Any, httpx.Headers]:
     try:
-        native_response: Final = rust_http_stream_bridge.open_stream(
-            provider="anthropic",
-            litellm_params=litellm_params,
-            custom_client=client is not None,
-            method="POST",
-            url=api_base,
-            headers=headers,
-            body=data.encode("utf-8"),
-            timeout=timeout,
-        )
         resolved_client: Final = client or litellm.module_level_client
-        response: Final = (
-            native_response
-            if native_response is not None
-            else resolved_client.post(
-                api_base,
-                headers=headers,
-                data=data,
-                stream=True,
-                timeout=timeout,
-                logging_obj=logging_obj,
-            )
+        response: Final = resolved_client.post(
+            api_base,
+            headers=headers,
+            data=data,
+            stream=True,
+            timeout=timeout,
+            logging_obj=logging_obj,
         )
     except httpx.HTTPStatusError as e:
         error_headers = getattr(e, "headers", None)
@@ -261,7 +230,6 @@ class AnthropicChatCompletion(BaseLLM):
             logging_obj=logging_obj,
             timeout=timeout,
             json_mode=json_mode,
-            litellm_params=litellm_params,
             speed=optional_params.get("speed") if optional_params else None,
             tool_name_reverse_map=(
                 litellm_params.get(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY) if isinstance(litellm_params, dict) else None
@@ -585,7 +553,6 @@ class AnthropicChatCompletion(BaseLLM):
                     stream=stream,
                     _is_function_call=_is_function_call,
                     json_mode=json_mode,
-                    litellm_params=litellm_params,
                     logger_fn=logger_fn,
                     headers=headers,
                     timeout=timeout,
@@ -630,7 +597,6 @@ class AnthropicChatCompletion(BaseLLM):
                     logging_obj=logging_obj,
                     timeout=timeout,
                     json_mode=json_mode,
-                    litellm_params=litellm_params,
                     speed=optional_params.get("speed") if optional_params else None,
                     tool_name_reverse_map=(
                         litellm_params.get(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY)

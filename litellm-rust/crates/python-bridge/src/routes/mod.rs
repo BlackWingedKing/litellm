@@ -89,6 +89,5 @@ routes!(
     audio_transcription,
     messages,
     chat_completions,
-    http_stream,
-    responses_websocket,
+    streaming,
 );

@@ -2350,14 +2350,15 @@ class TestRustChatCompletionsHook:
         seen = self._inject()
         with patch.object(
             AnthropicConfig, "transform_request", return_value={"model": "m", "messages": []}
-        ):
-            try:
-                AnthropicChatCompletion().completion(
-                    **self._completion_kwargs(optional_params={"max_tokens": 16, "stream": True})
-                )
-            except Exception:
-                pass
+        ), patch(
+            "litellm.llms.anthropic.chat.handler.make_sync_call",
+            return_value=(iter(()), MagicMock()),
+        ) as python_call:
+            AnthropicChatCompletion().completion(
+                **self._completion_kwargs(optional_params={"max_tokens": 16, "stream": True})
+            )
         assert seen["call"] == []
+        assert python_call.call_count == 1
 
     def test_pre_call_logging_fires_exactly_once_on_the_rust_path(self):
         from litellm.llms.anthropic.chat.handler import AnthropicChatCompletion
