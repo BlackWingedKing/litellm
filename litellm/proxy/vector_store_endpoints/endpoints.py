@@ -15,7 +15,7 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.utils import jsonify_object
 from litellm.proxy.vector_store_endpoints.management_endpoints import (
-    _resolve_embedding_config,
+    _resolve_embedding_model_config,
 )
 from litellm.proxy.vector_store_endpoints.utils import (
     assert_proxy_admin_for_vector_store_index_management,
@@ -65,32 +65,37 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
             data["litellm_credential_name"] = vector_store_to_run.get("litellm_credential_name")
 
         if "litellm_params" in vector_store_to_run:
-            litellm_params = vector_store_to_run.get("litellm_params", {}) or {}
-            # Resolve ``litellm_embedding_config`` here, at request-handling
-            # time, instead of at row-creation time. The resolved
-            # ``api_key`` / ``api_base`` / ``api_version`` lives only in
-            # this per-request ``data`` dict and is never persisted.
-            # Legacy rows that already carry a resolved (cleartext)
-            # ``litellm_embedding_config`` skip the lookup and pass through
-            # unchanged so the embed call keeps working.
-            embedding_model: Final = litellm_params.get("litellm_embedding_model")
-            if embedding_model and not litellm_params.get("litellm_embedding_config"):
-                from litellm.proxy.proxy_server import prisma_client
+            stored_litellm_params: Final = (
+                vector_store_to_run.get("litellm_params", {}) or {}  # mutable-ok: request parameter dictionary
+            )
+            embedding_model: Final = stored_litellm_params.get("litellm_embedding_model")
+            if embedding_model is not None and not isinstance(embedding_model, str):
+                raise HTTPException(status_code=400, detail="Invalid managed vector store embedding model")
 
-                resolved_config: Final = await _resolve_embedding_config(
-                    embedding_model=embedding_model, prisma_client=prisma_client
+            if embedding_model:
+                from litellm.proxy.proxy_server import llm_router, prisma_client
+
+                team_id: Final = user_api_key_dict.team_id if user_api_key_dict is not None else None
+                resolution: Final = await _resolve_embedding_model_config(
+                    embedding_model=embedding_model,
+                    prisma_client=prisma_client,
+                    llm_router=llm_router,
+                    team_id=team_id,
                 )
-                if resolved_config:
-                    # Build a fresh dict via spread instead of mutating
-                    # ``litellm_params`` in place — the registry hands back
-                    # a reference to its cached object, so an in-place
-                    # update would persist the resolved cleartext into the
-                    # in-memory cache for the lifetime of the process.
-                    litellm_params = {
-                        **litellm_params,
-                        "litellm_embedding_config": resolved_config,
-                    }
-            data.update(litellm_params)
+                if resolution is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unable to resolve an authorized embedding deployment for this vector store",
+                    )
+                resolved_model, resolved_config = resolution
+                request_litellm_params: Final = {  # mutable-ok: per-request provider parameter dictionary
+                    **stored_litellm_params,
+                    "litellm_embedding_model": resolved_model,
+                    "litellm_embedding_config": resolved_config,
+                }
+                data.update(request_litellm_params)
+            else:
+                data.update(stored_litellm_params)
     return data
 
 

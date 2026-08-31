@@ -10,20 +10,22 @@ All /vector_store management endpoints
 
 import copy
 import json
-from typing import TYPE_CHECKING, Any, Final
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Final, TypeAlias, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 
 if TYPE_CHECKING:
     from prisma.models import LiteLLM_ManagedVectorStoresTable as _VectorStoreRow
 
+    from litellm.models.model import LiteLLM_ProxyModelTable
     from litellm.proxy.utils import PrismaClient
     from litellm.router import Router
 
 import litellm
 from litellm._logging import verbose_proxy_logger
-from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import REDACTED_BY_LITELM_STRING
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
 from litellm.proxy._types import (
@@ -32,13 +34,13 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper
 from litellm.proxy.common_utils.rbac_utils import check_feature_access_for_user
 from litellm.proxy.vector_store_endpoints.utils import can_user_access_vector_store
 from litellm.repositories.model_repository import ModelRepository
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.repositories.table_repositories import ManagedVectorStoresRepository
 from litellm.secret_managers.main import get_secret
+from litellm.types.router import CredentialLiteLLMParams
 from litellm.types.vector_stores import (
     LiteLLM_ManagedVectorStore,
     LiteLLM_ManagedVectorStoreListResponse,
@@ -63,28 +65,28 @@ _LITELLM_PARAMS_MASKER: Final = SensitiveDataMasker()
 
 
 _REDACT_LITELLM_PARAMS_MAX_DEPTH: Final = 10
+_EMBEDDING_CONFIG_EXCLUDED_KEYS: Final = frozenset({"custom_llm_provider", "litellm_credential_name", "model"})
 
-# Use-time embedding-config resolution runs on every vector-store request
-# whose persisted row carries only a model reference (the post-fix shape).
-# Without a cache, that's one ``litellm_proxymodeltable.find_first`` per
-# request — the no-DB-in-critical-path rule. Hold the resolved config in
-# memory for a short TTL so a hot model name pays the DB lookup at most
-# once per ``_EMBEDDING_CONFIG_CACHE_TTL`` seconds. Cleartext credentials
-# only ever live in process memory (never persisted, never echoed in
-# management responses), so the cache doesn't widen the disclosure surface.
-_EMBEDDING_CONFIG_CACHE_TTL: Final = 60
-_EMBEDDING_CONFIG_CACHE_MAX_SIZE: Final = 256
-_embedding_config_cache: InMemoryCache | None = None
+EmbeddingResolution: TypeAlias = tuple[
+    str,
+    dict[str, object],  # mutable-ok: downstream embedding APIs accept keyword dictionaries
+]
 
 
-def _get_embedding_config_cache() -> InMemoryCache:
-    global _embedding_config_cache
-    if _embedding_config_cache is None:
-        _embedding_config_cache = InMemoryCache(
-            max_size_in_memory=_EMBEDDING_CONFIG_CACHE_MAX_SIZE,
-            default_ttl=_EMBEDDING_CONFIG_CACHE_TTL,
-        )
-    return _embedding_config_cache
+def _as_string_object_dict(  # mutable-ok: normalizes external credential mappings for provider calls
+    value: object,
+) -> dict[str, object] | None:  # mutable-ok: downstream provider API requires a keyword dictionary
+    if not isinstance(value, Mapping):
+        return None
+    mapping: Final = cast(  # cast-ok: isinstance validated the otherwise unparameterized Mapping
+        Mapping[object, object], value
+    )
+    result: Final[dict[str, object]] = {}  # mutable-ok: built locally and returned to the provider boundary
+    for key, item in mapping.items():
+        if not isinstance(key, str):
+            return None
+        result[key] = item
+    return result
 
 
 def _redact_sensitive_litellm_params(litellm_params: Any, _depth: int = 0) -> Any:
@@ -155,233 +157,173 @@ async def _fetch_and_authorize_vector_store(
     return typed
 
 
-def _resolve_embedding_config_from_router(embedding_model: str, llm_router) -> dict[str, object] | None:
-    """
-    Resolve embedding config from router's config-defined models.
+def _resolve_secret_references(  # mutable-ok: downstream embedding APIs accept keyword dictionaries
+    config: Mapping[str, object],
+) -> dict[str, object] | None:  # mutable-ok: downstream provider API requires a keyword dictionary
+    resolved_config: Final[dict[str, object]] = {}  # mutable-ok: built locally for the provider boundary
+    for key, value in config.items():
+        if isinstance(value, str) and value.startswith("os.environ/"):
+            resolved_value: object | None = cast(  # cast-ok: secret backends expose a deliberately broad return type
+                object | None, get_secret(value)
+            )
+            if resolved_value is None:
+                return None
+            resolved_config[key] = resolved_value
+        elif value is not None:
+            resolved_config[key] = value
+    return resolved_config
 
-    Config-defined models (from proxy_config.yaml) are stored in the router's model_list,
-    not in the database. This function looks up the model in the router and extracts
-    api_key, api_base, and api_version from the deployment's litellm_params.
 
-    Args:
-        embedding_model: The embedding model string (e.g., "text-embedding-ada-002" or "azure/text-embedding-3-large")
-        llm_router: The LiteLLM router instance
+def _embedding_resolution_from_credentials(credentials: Mapping[str, object]) -> EmbeddingResolution | None:
+    model: Final = credentials.get("model")
+    provider: Final = credentials.get("custom_llm_provider")
+    if not isinstance(model, str) or not model:
+        return None
 
-    Returns:
-        Dictionary with api_key, api_base, and api_version if model found, None otherwise
-    """
+    provider_name: Final = provider if isinstance(provider, str) and provider else "openai"
+    provider_qualified_model: Final = model if "/" in model else f"{provider_name}/{model}"
+    if "*" in provider_qualified_model:
+        return None
+
+    config: Final = _resolve_secret_references(
+        {  # mutable-ok: provider resolver consumes keyword dictionaries
+            key: value
+            for key, value in credentials.items()
+            if key not in _EMBEDDING_CONFIG_EXCLUDED_KEYS and value is not None
+        }
+    )
+    if not config:
+        return None
+    return provider_qualified_model, config
+
+
+def _resolve_embedding_model_config_from_router(
+    embedding_model: str,
+    llm_router: "Router | None",
+    team_id: str | None,
+) -> EmbeddingResolution | None:
     if not embedding_model or llm_router is None:
         return None
-
-    # Extract model name candidates - could be "text-embedding-ada-002" or "azure/text-embedding-3-large"
-    # Try exact match first, then try without provider prefix
-    model_name_candidates: Final = [embedding_model]
-    if "/" in embedding_model:
-        # If it has a provider prefix, also try without it
-        _, model_name = embedding_model.split("/", 1)
-        model_name_candidates.append(model_name)
-
-    # Try to find model in router
-    for model_name in model_name_candidates:
-        try:
-            # Try to get deployment by model group name (model_name in config)
-            deployment = llm_router.get_deployment_by_model_group_name(model_group_name=model_name)
-
-            if deployment is not None and deployment.litellm_params is not None:
-                litellm_params = deployment.litellm_params
-
-                # Build embedding config from model params
-                embedding_config: dict[str, object] = {}
-
-                # Extract api_key
-                api_key = getattr(litellm_params, "api_key", None)
-                if api_key:
-                    # Handle os.environ/ prefix
-                    if isinstance(api_key, str) and api_key.startswith("os.environ/"):
-                        api_key = get_secret(api_key)
-                    embedding_config["api_key"] = api_key
-
-                # Extract api_base
-                api_base = getattr(litellm_params, "api_base", None)
-                if api_base:
-                    # Handle os.environ/ prefix
-                    if isinstance(api_base, str) and api_base.startswith("os.environ/"):
-                        api_base = get_secret(api_base)
-                    embedding_config["api_base"] = api_base
-
-                # Extract api_version
-                api_version = getattr(litellm_params, "api_version", None)
-                if api_version:
-                    embedding_config["api_version"] = api_version
-
-                project_id = getattr(litellm_params, "project_id", None)
-                if project_id:
-                    embedding_config["project_id"] = project_id
-
-                # Only return config if we have at least api_key or api_base
-                if embedding_config:
-                    verbose_proxy_logger.debug(
-                        "Resolved embedding config from router model %s: %s", model_name, list(embedding_config.keys())
-                    )
-                    return embedding_config
-        except Exception as e:
-            verbose_proxy_logger.debug("Error resolving embedding config from router for model %s: %s", model_name, e)
-            continue
-
-    return None
-
-
-async def _resolve_embedding_config_from_db(
-    embedding_model: str, prisma_client: "PrismaClient"
-) -> dict[str, object] | None:
-    """
-    Resolve embedding config from database model configuration.
-
-    If litellm_embedding_model is provided but litellm_embedding_config is not,
-    this function looks up the model in the database and extracts api_key, api_base,
-    and api_version from the model's litellm_params to build the embedding config.
-
-    Args:
-        embedding_model: The embedding model string (e.g., "text-embedding-ada-002" or "azure/text-embedding-3-large")
-        prisma_client: The Prisma client instance
-
-    Returns:
-        Dictionary with api_key, api_base, and api_version if model found, None otherwise
-    """
-    if not embedding_model:
-        return None
-
-    # Extract model name - could be "text-embedding-ada-002" or "azure/text-embedding-3-large"
-    # Try to find model by exact match first, then try without provider prefix
-    model_name_candidates: Final = [embedding_model]
-    if "/" in embedding_model:
-        # If it has a provider prefix, also try without it
-        _, model_name = embedding_model.split("/", 1)
-        model_name_candidates.append(model_name)
-
-    # Try to find model in database
-    for model_name in model_name_candidates:
-        try:
-            db_model = await ModelRepository(prisma_client).table.find_first(where={"model_name": model_name})
-
-            if db_model and db_model.litellm_params:
-                # Extract litellm_params (could be dict or JSON string)
-                model_params = db_model.litellm_params
-                if isinstance(model_params, str):  # pyright: ignore[reportUnnecessaryIsInstance]  # prisma Json is str
-                    model_params = json.loads(model_params)
-
-                # Decrypt values from database (similar to how proxy_server.py does it)
-                # Values stored in DB are encrypted, so we need to decrypt them first
-                decrypted_params = {}
-                if isinstance(model_params, dict):
-                    for k, v in model_params.items():
-                        if isinstance(v, str):
-                            # Decrypt value - returns original value if decryption fails or no key is set
-                            decrypted_value = decrypt_value_helper(value=v, key=k, return_original_value=True)
-                            decrypted_params[k] = decrypted_value
-                        else:
-                            decrypted_params[k] = v
-                else:
-                    decrypted_params = model_params
-
-                # Build embedding config from model params
-                embedding_config = {}
-
-                # Extract api_key
-                api_key = decrypted_params.get("api_key")
-                if api_key:
-                    # Handle os.environ/ prefix (after decryption, values may be os.environ/ prefixed)
-                    if isinstance(api_key, str) and api_key.startswith("os.environ/"):
-                        api_key = get_secret(api_key)
-                    embedding_config["api_key"] = api_key
-
-                # Extract api_base
-                api_base = decrypted_params.get("api_base")
-                if api_base:
-                    # Handle os.environ/ prefix (after decryption, values may be os.environ/ prefixed)
-                    if isinstance(api_base, str) and api_base.startswith("os.environ/"):
-                        api_base = get_secret(api_base)
-                    embedding_config["api_base"] = api_base
-
-                # Extract api_version
-                api_version = decrypted_params.get("api_version")
-                if api_version:
-                    embedding_config["api_version"] = api_version
-
-                # Only return config if we have at least api_key or api_base
-                if embedding_config:
-                    verbose_proxy_logger.debug(
-                        "Resolved embedding config from database model %s: %s",
-                        model_name,
-                        list(embedding_config.keys()),
-                    )
-                    return embedding_config
-        except Exception as e:
-            verbose_proxy_logger.debug("Error resolving embedding config for model %s: %s", model_name, e)
-            continue
-
-    return None
-
-
-async def _resolve_embedding_config(
-    embedding_model: str, prisma_client: "PrismaClient | None", llm_router: "Router | None" = None
-) -> dict[str, object] | None:
-    """
-    Resolve embedding config from either router (config-defined) or database models.
-
-    This function first checks the router for config-defined models, then falls back
-    to the database. This allows users to use models defined in either location.
-
-    Results are cached in process memory for ``_EMBEDDING_CONFIG_CACHE_TTL``
-    seconds so the request-handling path doesn't hit the database on every
-    vector-store call. Negative results (model not found) are intentionally
-    not cached to avoid blocking a freshly-added model behind the TTL.
-
-    Args:
-        embedding_model: The embedding model string (e.g., "text-embedding-ada-002" or "azure/text-embedding-3-large")
-        prisma_client: The Prisma client instance
-        llm_router: The LiteLLM router instance (optional, will be imported if not provided)
-
-    Returns:
-        Dictionary with api_key, api_base, and api_version if model found, None otherwise
-    """
-    if not embedding_model:
-        return None
-
-    cache: Final = _get_embedding_config_cache()
-    cached: Final = cache.get_cache(embedding_model)
-    if cached is not None:
-        return cached
-
-    # Import llm_router if not provided
-    if llm_router is None:
-        try:
-            from litellm.proxy.proxy_server import llm_router
-        except ImportError:
-            llm_router = None
-
-    # First try to resolve from router (config-defined models)
-    if llm_router is not None:
-        router_config = _resolve_embedding_config_from_router(embedding_model=embedding_model, llm_router=llm_router)
-        if router_config:
-            verbose_proxy_logger.debug("Resolved embedding config from router for model %s", embedding_model)
-            cache.set_cache(embedding_model, router_config)
-            return router_config
-
-    # Fall back to database
-    if prisma_client is not None:
-        db_config: Final = await _resolve_embedding_config_from_db(
-            embedding_model=embedding_model, prisma_client=prisma_client
+    try:
+        credentials: Final = llm_router.get_deployment_credentials_with_provider(
+            model_id=embedding_model,
+            team_id=team_id,
         )
-        if db_config:
-            verbose_proxy_logger.debug("Resolved embedding config from database for model %s", embedding_model)
-            cache.set_cache(embedding_model, db_config)
-            return db_config
+        typed_credentials: Final = _as_string_object_dict(credentials)
+        if typed_credentials is None:
+            return None
+        return _embedding_resolution_from_credentials(typed_credentials)
+    except Exception as e:
+        verbose_proxy_logger.debug("Error resolving embedding model %s from Router: %s", embedding_model, e)
+        return None
 
-    verbose_proxy_logger.debug(
-        "Could not resolve embedding config for model %s from router or database", embedding_model
+
+def _select_team_safe_db_model(
+    models: Sequence["LiteLLM_ProxyModelTable"],
+    team_id: str | None,
+) -> "LiteLLM_ProxyModelTable | None":
+    team_models: Final = tuple(model for model in models if team_id is not None and model.team_id == team_id)
+    shared_models: Final = tuple(model for model in models if model.team_id is None)
+    return next(iter(team_models), None) or next(iter(shared_models), None)
+
+
+def _embedding_resolution_from_db_model(
+    model: "LiteLLM_ProxyModelTable",
+) -> EmbeddingResolution | None:
+    if model.blocked:
+        return None
+    params: Final = _as_string_object_dict(
+        cast(object, model.litellm_params)  # cast-ok: Prisma model params are legacy unparameterized dictionaries
     )
-    return None
+    if params is None:
+        return None
+    underlying_model: Final = params.get("model")
+    if not isinstance(underlying_model, str) or not underlying_model:
+        return None
+
+    credential_name: Final = params.get("litellm_credential_name")
+    if credential_name is not None and not isinstance(credential_name, str):
+        return None
+    named_credentials: Final = (
+        _as_string_object_dict(
+            cast(  # cast-ok: credential storage exposes a legacy unparameterized dictionary
+                object, CredentialAccessor.get_credential_values(credential_name)
+            )
+        )
+        if credential_name is not None
+        else {}  # mutable-ok: local empty credential overlay
+    )
+    if named_credentials is None or (credential_name is not None and not named_credentials):
+        return None
+
+    deployment_credentials: Final = _as_string_object_dict(
+        CredentialLiteLLMParams.model_validate(params).model_dump(exclude_none=True)
+    )
+    if deployment_credentials is None:
+        return None
+    provider: Final = params.get("custom_llm_provider")
+    credentials: Final = {  # mutable-ok: provider resolver consumes keyword dictionaries
+        **deployment_credentials,
+        **named_credentials,
+        "model": underlying_model,
+        **(
+            {"custom_llm_provider": provider}  # mutable-ok: conditional keyword overlay
+            if isinstance(provider, str) and provider
+            else {}  # mutable-ok: conditional keyword overlay
+        ),
+    }
+    return _embedding_resolution_from_credentials(credentials)
+
+
+async def _resolve_embedding_model_config_from_db(
+    embedding_model: str,
+    prisma_client: "PrismaClient",
+    team_id: str | None,
+) -> EmbeddingResolution | None:
+    if not embedding_model:
+        return None
+    where: Final[dict[str, object]] = {  # mutable-ok: Prisma requires a JSON-shaped filter dictionary
+        "blocked": False,
+        "OR": [  # mutable-ok: Prisma requires a JSON-shaped OR list
+            {"model_name": embedding_model},  # mutable-ok: Prisma filter clause
+            {"model_id": embedding_model},  # mutable-ok: Prisma filter clause
+            {  # mutable-ok: Prisma filter clause
+                "model_info": {  # mutable-ok: Prisma JSON filter
+                    "path": ["team_public_model_name"],  # mutable-ok: Prisma JSON path list
+                    "equals": json.dumps(embedding_model),
+                }
+            },
+        ],
+    }
+    try:
+        candidates: Final = await ModelRepository(prisma_client).find_many(where=where)
+        selected: Final = _select_team_safe_db_model(models=candidates, team_id=team_id)
+        return _embedding_resolution_from_db_model(selected) if selected is not None else None
+    except Exception as e:
+        verbose_proxy_logger.debug("Error resolving embedding model %s from database: %s", embedding_model, e)
+        return None
+
+
+async def _resolve_embedding_model_config(
+    embedding_model: str,
+    prisma_client: "PrismaClient | None",
+    llm_router: "Router | None",
+    team_id: str | None,
+) -> EmbeddingResolution | None:
+    router_resolution: Final = _resolve_embedding_model_config_from_router(
+        embedding_model=embedding_model,
+        llm_router=llm_router,
+        team_id=team_id,
+    )
+    if router_resolution is not None:
+        return router_resolution
+    if prisma_client is None:
+        return None
+    return await _resolve_embedding_model_config_from_db(
+        embedding_model=embedding_model,
+        prisma_client=prisma_client,
+        team_id=team_id,
+    )
 
 
 ########################################################
