@@ -1442,11 +1442,13 @@ name = "litellm-python-bridge"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "futures-util",
  "litellm-ai-gateway",
  "litellm-core",
  "litellm-python-interop",
  "pyo3",
  "pyo3-async-runtimes",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

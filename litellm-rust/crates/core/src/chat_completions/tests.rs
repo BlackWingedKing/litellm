@@ -1,6 +1,6 @@
 use serde_json::{Map, Value, json};
 
-use crate::error::CoreError;
+use crate::error::{CoreError, ProviderCallError};
 
 use super::prepare::prepare_chat_completions_call;
 use super::transformation::ChatCompletionsAuth;
@@ -476,112 +476,20 @@ fn a_bedrock_api_key_is_sent_as_a_bearer_token_instead_of_being_signed() {
     );
 }
 
-fn decline_reason(
-    model: &str,
-    provider: Option<&str>,
-    messages: Value,
-    params: Value,
-) -> Option<&'static str> {
-    let params = match params {
-        Value::Object(map) => map,
-        other => panic!("params must be an object, got {other}"),
-    };
-    super::chat_completions_decline_reason(model, provider, messages, &params)
-}
-
-#[test]
-fn the_gate_accepts_what_prepare_accepts() {
-    assert_eq!(
-        decline_reason(
-            "anthropic/claude-sonnet-4-5",
-            None,
-            json!([{"role": "user", "content": "hi"}]),
-            json!({"max_tokens": 16}),
-        ),
-        None
-    );
-}
-
-#[test]
-fn the_gate_declines_without_resolving_credentials_or_calling_out() {
-    assert_eq!(
-        decline_reason(
-            "anthropic/claude-sonnet-4-5",
-            None,
-            json!([{"role": "user", "content": "hi"}]),
-            json!({"stream": true}),
-        ),
-        Some("streaming")
-    );
-    assert_eq!(
-        decline_reason(
-            "openai/gpt-4o",
-            None,
-            json!([{"role": "user", "content": "hi"}]),
-            json!({}),
-        ),
-        Some("provider is not on the rust chat completions path")
-    );
-    assert_eq!(
-        decline_reason(
-            "claude-sonnet-4-5",
-            None,
-            json!([{"role": "user", "content": "hi"}]),
-            json!({}),
-        ),
-        Some("provider is not on the rust chat completions path")
-    );
-    assert_eq!(
-        decline_reason(
-            "anthropic/claude-sonnet-4-5",
-            None,
-            json!("nope"),
-            json!({})
-        ),
-        Some("unreadable message list")
-    );
-    assert_eq!(
-        decline_reason("anthropic/claude-sonnet-4-5", None, json!([]), json!({})),
-        Some("empty message list")
-    );
-}
-
-#[test]
-fn the_gate_agrees_with_prepare_on_every_case_it_accepts() {
-    // A gate that accepts what prepare then declines would make the host emit
-    // its pre-call logging on a path that falls back, so pin the agreement.
-    for (messages, params) in [
-        (
-            json!([{"role": "user", "content": "hi"}]),
-            json!({"max_tokens": 8}),
-        ),
-        (
-            json!([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]),
-            json!({"temperature": 0.1}),
-        ),
-        (
-            json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]),
-            json!({}),
-        ),
-    ] {
-        assert_eq!(
-            decline_reason(
-                "anthropic/claude-sonnet-4-5",
-                None,
-                messages.clone(),
-                params.clone()
-            ),
-            None,
-            "gate declined {messages}"
-        );
-        prepare_chat_completions_call(request(
-            "anthropic/claude-sonnet-4-5",
-            None,
-            messages.clone(),
-            params,
-        ))
-        .unwrap_or_else(|error| panic!("prepare declined {messages}: {error}"));
-    }
+#[tokio::test]
+async fn an_unsupported_request_is_typed_as_not_sent() {
+    let error = super::chat_completions(request(
+        "anthropic/claude-sonnet-4-5",
+        None,
+        json!([{"role": "user", "content": "hi"}]),
+        json!({"stream": true}),
+    ))
+    .await
+    .expect_err("streaming is outside the rust path");
+    assert!(matches!(
+        error,
+        ProviderCallError::NotSent(CoreError::Unsupported("streaming"))
+    ));
 }
 
 mod round_trip {
@@ -727,7 +635,10 @@ mod round_trip {
         .expect_err("response cannot be normalized");
         handle.await.expect("server task");
         assert!(
-            matches!(err, CoreError::InvalidResponse(_)),
+            matches!(
+                err,
+                ProviderCallError::PossiblySent(CoreError::InvalidResponse(_))
+            ),
             "expected a post-send error, got {err:?}"
         );
     }
@@ -745,7 +656,10 @@ mod round_trip {
         .expect_err("response cannot be normalized");
         handle.await.expect("server task");
         assert!(
-            matches!(err, CoreError::InvalidResponse(_)),
+            matches!(
+                err,
+                ProviderCallError::PossiblySent(CoreError::InvalidResponse(_))
+            ),
             "expected a post-send error, got {err:?}"
         );
     }
@@ -763,7 +677,10 @@ mod round_trip {
         .expect_err("upstream rejects");
         handle.await.expect("server task");
         assert!(
-            matches!(err, CoreError::Http { status: 429, .. }),
+            matches!(
+                err,
+                ProviderCallError::PossiblySent(CoreError::Http { status: 429, .. })
+            ),
             "expected a 429, got {err:?}"
         );
     }
@@ -787,7 +704,7 @@ mod round_trip {
         .await
         .expect_err("nothing is listening");
         assert!(
-            matches!(err, CoreError::Connect(_)),
+            matches!(err, ProviderCallError::NotSent(CoreError::Connect(_))),
             "expected a pre-send connect failure, got {err:?}"
         );
     }

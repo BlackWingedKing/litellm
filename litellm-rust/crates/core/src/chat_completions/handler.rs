@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, ProviderCallError, ProviderCallResult};
 use crate::http_utils::truncate_error_body;
 
 use super::client::http_client;
@@ -11,13 +11,15 @@ use super::types::{
 
 pub(super) async fn execute_chat_completions_provider_call(
     request: ProviderChatCompletionsRequest,
-) -> CoreResult<ChatCompletionsResponse> {
+) -> ProviderCallResult<ChatCompletionsResponse> {
     let body = serde_json::to_vec(&request.body).map_err(|err| {
-        CoreError::InvalidRequest(format!(
+        ProviderCallError::NotSent(CoreError::InvalidRequest(format!(
             "failed to serialize chat completions request: {err}"
-        ))
+        )))
     })?;
-    let headers = signed_headers(&request, &body).await?;
+    let headers = signed_headers(&request, &body)
+        .await
+        .map_err(ProviderCallError::NotSent)?;
 
     let mut request_builder = http_client().post(&request.url).body(body);
     for (key, value) in &headers {
@@ -32,9 +34,9 @@ pub(super) async fn execute_chat_completions_provider_call(
         // so the host can still serve it. Everything else here, a timeout
         // above all, may have reached the provider and been answered.
         if err.is_connect() || err.is_builder() {
-            CoreError::Connect(err.to_string())
+            ProviderCallError::NotSent(CoreError::Connect(err.to_string()))
         } else {
-            CoreError::Network(err.to_string())
+            ProviderCallError::PossiblySent(CoreError::Network(err.to_string()))
         }
     })?;
 
@@ -42,22 +44,25 @@ pub(super) async fn execute_chat_completions_provider_call(
     let text = response
         .text()
         .await
-        .map_err(|err| CoreError::Network(err.to_string()))?;
+        .map_err(|err| ProviderCallError::PossiblySent(CoreError::Network(err.to_string())))?;
 
     if !status.is_success() {
-        return Err(CoreError::Http {
+        return Err(ProviderCallError::PossiblySent(CoreError::Http {
             status: status.as_u16(),
             body: truncate_error_body(&text),
-        });
+        }));
     }
 
     let body: Value = serde_json::from_str(&text).map_err(|err| {
-        CoreError::InvalidResponse(format!("invalid chat completions response JSON: {err}"))
+        ProviderCallError::PossiblySent(CoreError::InvalidResponse(format!(
+            "invalid chat completions response JSON: {err}"
+        )))
     })?;
     request
         .config
         .transform_response(&request.model, ProviderChatResponseData { body })
         .map_err(as_response_error)
+        .map_err(ProviderCallError::PossiblySent)
 }
 
 /// Re-tag an error raised while normalizing a response the provider already

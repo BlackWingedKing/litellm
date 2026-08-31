@@ -1,10 +1,9 @@
 use litellm_ai_gateway::io::ocr::{OcrRequest, ocr as run_ocr};
-use litellm_core::error::CoreResult;
 use litellm_python_interop::from_py;
 use pyo3::prelude::*;
 use serde_json::{Map, Value};
 
-use crate::errors::core_error_to_pyerr;
+use crate::errors::BridgeResult;
 use crate::marshal::{RouteOptions, object_or_empty};
 use crate::routes::BridgeRoute;
 
@@ -17,7 +16,7 @@ struct OcrCall {
 impl BridgeRoute<OcrInputs> for OcrCall {
     type Output = Value;
 
-    fn from_python(py: Python<'_>, inputs: OcrInputs) -> PyResult<Self> {
+    fn from_python(py: Python<'_>, inputs: OcrInputs) -> BridgeResult<Self> {
         Ok(Self {
             options: RouteOptions::from_python(
                 py,
@@ -33,7 +32,7 @@ impl BridgeRoute<OcrInputs> for OcrCall {
         })
     }
 
-    async fn run(self) -> CoreResult<Value> {
+    async fn run(self) -> BridgeResult<Value> {
         let RouteOptions {
             model,
             api_key,
@@ -57,6 +56,7 @@ impl BridgeRoute<OcrInputs> for OcrCall {
             litellm_call_id: None,
         })
         .await
+        .map_err(Into::into)
     }
 }
 
@@ -77,5 +77,4 @@ bridge_route! {
         timeout_seconds: Option<f64>,
     },
     call = OcrCall,
-    errors = core_error_to_pyerr,
 }

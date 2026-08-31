@@ -1,7 +1,6 @@
 mod diagnostics;
 mod errors;
 mod marshal;
-mod responses_websocket;
 mod routes;
 
 use pyo3::prelude::*;
@@ -10,7 +9,6 @@ use pyo3::prelude::*;
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(module)?;
     routes::register(module)?;
-    responses_websocket::register(module)?;
     diagnostics::register(module)
 }
 
@@ -32,9 +30,11 @@ mod tests {
                 "atranscription",
                 "messages",
                 "amessages",
-                "chat_completions_decline",
                 "chat_completions",
                 "achat_completions",
+                "open_http_stream",
+                "aopen_http_stream",
+                "HttpResponseStream",
                 "ResponsesWebSocketConnection",
                 "RustBridgeDeclined",
                 "RustUpstreamError",

@@ -1,52 +1,21 @@
 use std::future::Future;
-use std::sync::mpsc::sync_channel;
 
-use litellm_core::error::{CoreError, CoreResult};
-use litellm_python_interop::{release_gil, to_py};
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use serde::Serialize;
+
+use crate::errors::BridgeResult;
+
+mod receiver;
+mod runtime;
+
+use runtime::{run_async, run_sync};
 
 trait BridgeRoute<I>: Sized {
     type Output: Serialize + Send + 'static;
 
-    fn from_python(py: Python<'_>, inputs: I) -> PyResult<Self>;
+    fn from_python(py: Python<'_>, inputs: I) -> BridgeResult<Self>;
 
-    fn run(self) -> impl Future<Output = CoreResult<Self::Output>> + Send + 'static;
-}
-
-fn run_sync<T, F>(
-    py: Python<'_>,
-    future: F,
-    map_error: fn(CoreError) -> PyErr,
-) -> PyResult<Py<PyAny>>
-where
-    T: Serialize + Send + 'static,
-    F: Future<Output = CoreResult<T>> + Send + 'static,
-{
-    let (sender, receiver) = sync_channel(1);
-    pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-        let _ = sender.send(future.await);
-    });
-    let result = release_gil(py, move || receiver.recv())
-        .map_err(|_| PyRuntimeError::new_err("native route task terminated"))?
-        .map_err(map_error)?;
-    to_py(py, &result)
-}
-
-fn run_async<T, F>(
-    py: Python<'_>,
-    future: F,
-    map_error: fn(CoreError) -> PyErr,
-) -> PyResult<Bound<'_, PyAny>>
-where
-    T: Serialize + Send + 'static,
-    F: Future<Output = CoreResult<T>> + Send + 'static,
-{
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let result = future.await.map_err(map_error)?;
-        Python::attach(|py| to_py(py, &result))
-    })
+    fn run(self) -> impl Future<Output = BridgeResult<Self::Output>> + Send + 'static;
 }
 
 macro_rules! bridge_route {
@@ -56,9 +25,7 @@ macro_rules! bridge_route {
         inputs = $inputs:ident,
         required = { $($required_name:ident: $required_type:ty),* $(,)? },
         optional = { $($optional_name:ident: $optional_type:ty),* $(,)? },
-        call = $call:ty,
-        errors = $map_error:path
-        $(, extra = [$($extra:ident),* $(,)?])?
+        call = $call:ty
         $(,)?
     ) => {
         struct $inputs {
@@ -77,12 +44,8 @@ macro_rules! bridge_route {
             let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
-            })?;
-            crate::routes::run_sync(
-                py,
-                <$call as crate::routes::BridgeRoute<$inputs>>::run(call),
-                $map_error,
-            )
+            }).map_err(crate::errors::BridgeError::into_pyerr)?;
+            crate::routes::run_sync(py, <$call as crate::routes::BridgeRoute<$inputs>>::run(call))
         }
 
         #[pyfunction]
@@ -96,12 +59,8 @@ macro_rules! bridge_route {
             let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
-            })?;
-            crate::routes::run_async(
-                py,
-                <$call as crate::routes::BridgeRoute<$inputs>>::run(call),
-                $map_error,
-            )
+            }).map_err(crate::errors::BridgeError::into_pyerr)?;
+            crate::routes::run_async(py, <$call as crate::routes::BridgeRoute<$inputs>>::run(call))
         }
 
         pub(super) fn register(
@@ -109,7 +68,6 @@ macro_rules! bridge_route {
         ) -> pyo3::PyResult<()> {
             module.add_function(pyo3::wrap_pyfunction!($sync_name, module)?)?;
             module.add_function(pyo3::wrap_pyfunction!($async_name, module)?)?;
-            $($(module.add_function(pyo3::wrap_pyfunction!($extra, module)?)?;)*)?
             Ok(())
         }
     };
@@ -126,28 +84,11 @@ macro_rules! routes {
     };
 }
 
-routes!(ocr, audio_transcription, messages, chat_completions);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sync_runner_dispatches_without_holding_the_gil() {
-        Python::initialize();
-        Python::attach(|py| {
-            let result = run_sync(py, async { Ok(42_u8) }, |error| {
-                PyRuntimeError::new_err(error.to_string())
-            })
-            .expect("route should complete");
-
-            assert_eq!(
-                result
-                    .bind(py)
-                    .extract::<u8>()
-                    .expect("result should convert"),
-                42
-            );
-        });
-    }
-}
+routes!(
+    ocr,
+    audio_transcription,
+    messages,
+    chat_completions,
+    http_stream,
+    responses_websocket,
+);

@@ -2219,11 +2219,11 @@ class TestRustChatCompletionsHook:
 
         monkeypatch.delenv("LITELLM_RUST", raising=False)
         bridge.set_rust_chat_completions(
-            chat_completions=None, achat_completions=None, decline=None
+            chat_completions=None, achat_completions=None
         )
         yield
         bridge.set_rust_chat_completions(
-            chat_completions=None, achat_completions=None, decline=None
+            chat_completions=None, achat_completions=None
         )
 
     @staticmethod
@@ -2261,14 +2261,10 @@ class TestRustChatCompletionsHook:
         logging_obj.post_call.side_effect = lambda **kwargs: calls["post_call"].append(kwargs)
         return logging_obj, calls
 
-    def _inject(self, *, decline_reason=None, sync_result=None, sync_error=None):
+    def _inject(self, *, sync_result=None, sync_error=None):
         from litellm.rust_bridge import chat_completions as bridge
 
-        seen = {"gate": [], "call": []}
-
-        def gate(**kwargs):
-            seen["gate"].append(kwargs)
-            return decline_reason
+        seen = {"call": []}
 
         def native(**kwargs):
             seen["call"].append(kwargs)
@@ -2276,7 +2272,7 @@ class TestRustChatCompletionsHook:
                 raise sync_error
             return dict(sync_result if sync_result is not None else self.RUST_RESPONSE)
 
-        bridge.set_rust_chat_completions(decline=gate, chat_completions=native)
+        bridge.set_rust_chat_completions(chat_completions=native)
         return seen
 
     def test_rust_true_serves_the_call_and_stamps_the_header(self):
@@ -2307,7 +2303,7 @@ class TestRustChatCompletionsHook:
             {"role": "user", "content": "hi"},
         ]
 
-    def test_the_anthropic_max_tokens_default_is_merged_in_before_the_gate(self):
+    def test_the_anthropic_max_tokens_default_is_merged_before_the_native_call(self):
         """`transform_request` applies `AnthropicConfig.get_config`; the Rust
         path skips it, so the handler has to merge it or Anthropic 400s on a
         request that omits `max_tokens`."""
@@ -2315,7 +2311,6 @@ class TestRustChatCompletionsHook:
 
         seen = self._inject()
         AnthropicChatCompletion().completion(**self._completion_kwargs(optional_params={}))
-        assert "max_tokens" in seen["gate"][0]["optional_params"]
         assert seen["call"][0]["optional_params"]["max_tokens"] > 0
 
     def test_a_caller_supplied_max_tokens_outranks_the_default(self):
@@ -2345,24 +2340,8 @@ class TestRustChatCompletionsHook:
                 # The Python path goes on to make an HTTP call; reaching it is
                 # the assertion, so the network failure below is expected.
                 pass
-        assert seen["gate"] == []
         assert seen["call"] == []
         assert transform.called
-
-    def test_a_declined_request_never_reaches_the_native_call(self):
-        from litellm.llms.anthropic.chat.handler import AnthropicChatCompletion
-        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-
-        seen = self._inject(decline_reason="unrecognized request parameter")
-        with patch.object(
-            AnthropicConfig, "transform_request", return_value={"model": "m", "messages": []}
-        ):
-            try:
-                AnthropicChatCompletion().completion(**self._completion_kwargs())
-            except Exception:
-                pass
-        assert len(seen["gate"]) == 1
-        assert seen["call"] == []
 
     def test_streaming_stays_on_the_python_path(self):
         from litellm.llms.anthropic.chat.handler import AnthropicChatCompletion
@@ -2378,7 +2357,7 @@ class TestRustChatCompletionsHook:
                 )
             except Exception:
                 pass
-        assert seen["gate"] == []
+        assert seen["call"] == []
 
     def test_pre_call_logging_fires_exactly_once_on_the_rust_path(self):
         from litellm.llms.anthropic.chat.handler import AnthropicChatCompletion
@@ -2428,9 +2407,7 @@ class TestRustChatCompletionsHook:
             raise _Declined("blank message text")
 
         monkeypatch.setattr(bridge, "get_native_bridge", lambda: _FakeNative())
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, chat_completions=declining_native
-        )
+        bridge.set_rust_chat_completions(chat_completions=declining_native)
 
         logging_obj, calls = self._recording_logging_obj()
         with patch.object(
@@ -2464,9 +2441,7 @@ class TestRustChatCompletionsHook:
         async def declining_native(**_kwargs):
             raise _Declined("blank message text")
 
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, achat_completions=declining_native
-        )
+        bridge.set_rust_chat_completions(achat_completions=declining_native)
 
         sentinel = object()
 
@@ -2491,9 +2466,7 @@ class TestRustChatCompletionsHook:
         async def native(**_kwargs):
             return dict(self.RUST_RESPONSE)
 
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, achat_completions=native
-        )
+        bridge.set_rust_chat_completions(achat_completions=native)
 
         with patch.object(AnthropicChatCompletion, "acompletion_function") as python_call:
             result = await AnthropicChatCompletion().completion(
@@ -2524,9 +2497,7 @@ class TestRustChatCompletionsHook:
         def declining_native(**_kwargs):
             raise _Declined("blank message text")
 
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, chat_completions=declining_native
-        )
+        bridge.set_rust_chat_completions(chat_completions=declining_native)
 
         logging_obj, calls = self._recording_logging_obj()
         with patch.object(

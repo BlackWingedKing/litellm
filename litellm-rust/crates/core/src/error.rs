@@ -1,6 +1,17 @@
 use thiserror::Error;
 
 pub type CoreResult<T> = Result<T, CoreError>;
+pub type ProviderCallResult<T> = Result<T, ProviderCallError>;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProviderCallError {
+    /// The provider received no request, so a host may use another implementation.
+    #[error("provider request was not sent: {0}")]
+    NotSent(#[source] CoreError),
+    /// The provider may have received the request, so retrying could duplicate work.
+    #[error("provider request may have been sent: {0}")]
+    PossiblySent(#[source] CoreError),
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CoreError {

@@ -50,20 +50,16 @@ RESOLVED_CREDENTIALS = Credentials(
 def reset_bridge(monkeypatch):
     monkeypatch.delenv("LITELLM_RUST", raising=False)
     bridge.set_rust_chat_completions(
-        chat_completions=None, achat_completions=None, decline=None
+        chat_completions=None, achat_completions=None
     )
     yield
     bridge.set_rust_chat_completions(
-        chat_completions=None, achat_completions=None, decline=None
+        chat_completions=None, achat_completions=None
     )
 
 
-def _inject(*, decline_reason=None, error: Exception | None = None):
-    seen: dict[str, list[dict]] = {"gate": [], "call": []}
-
-    def gate(**kwargs):
-        seen["gate"].append(kwargs)
-        return decline_reason
+def _inject(*, error: Exception | None = None):
+    seen: dict[str, list[dict]] = {"call": []}
 
     def native(**kwargs):
         seen["call"].append(kwargs)
@@ -71,7 +67,7 @@ def _inject(*, decline_reason=None, error: Exception | None = None):
             raise error
         return dict(RUST_RESPONSE)
 
-    bridge.set_rust_chat_completions(decline=gate, chat_completions=native)
+    bridge.set_rust_chat_completions(chat_completions=native)
     return seen
 
 
@@ -167,7 +163,6 @@ def test_without_the_opt_in_the_core_is_never_consulted():
         # The Python path goes on to make an HTTP call; not reaching the gate
         # is the assertion, so a failure past this point is expected.
         pass
-    assert seen["gate"] == []
     assert seen["call"] == []
 
 
@@ -177,16 +172,6 @@ def test_streaming_stays_on_the_python_path():
         _run(optional_params={"maxTokens": 16, "stream": True})
     except Exception:
         pass
-    assert seen["gate"] == []
-
-
-def test_a_declined_request_never_reaches_the_native_call():
-    seen = _inject(decline_reason="unrecognized request parameter")
-    try:
-        _run()
-    except Exception:
-        pass
-    assert len(seen["gate"]) == 1
     assert seen["call"] == []
 
 
@@ -211,9 +196,7 @@ async def test_the_async_path_falls_back_when_the_core_declines(monkeypatch):
     async def declining_native(**_kwargs):
         raise _Declined("blank message text")
 
-    bridge.set_rust_chat_completions(
-        decline=lambda **_kwargs: None, achat_completions=declining_native
-    )
+    bridge.set_rust_chat_completions(achat_completions=declining_native)
 
     sentinel = object()
 
@@ -241,9 +224,7 @@ async def test_the_async_path_serves_the_rust_response_without_the_fallback():
     async def native(**_kwargs):
         return dict(RUST_RESPONSE)
 
-    bridge.set_rust_chat_completions(
-        decline=lambda **_kwargs: None, achat_completions=native
-    )
+    bridge.set_rust_chat_completions(achat_completions=native)
 
     with (
         patch.object(
@@ -291,9 +272,7 @@ async def test_pre_call_logging_fires_once_even_when_the_rust_path_declines():
             BedrockConverseLLM, "async_completion", side_effect=python_path
         ),
     ):
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, achat_completions=declining_native
-        )
+        bridge.set_rust_chat_completions(achat_completions=declining_native)
         await BedrockConverseLLM().completion(
             **_completion_kwargs(acompletion=True, logging_obj=logging_obj)
         )
@@ -391,9 +370,7 @@ def test_pre_call_logging_fires_once_when_the_sync_rust_path_declines():
     logging_obj = MagicMock()
 
     with patch.object(bridge, "get_native_bridge", lambda: _FakeNative()):
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, chat_completions=declining_native
-        )
+        bridge.set_rust_chat_completions(chat_completions=declining_native)
         response = _run(
             logging_obj=logging_obj,
             client=_sync_client_returning_converse_response(),
@@ -441,9 +418,7 @@ async def test_post_call_logging_fires_on_the_async_rust_path():
     async def native(**_kwargs):
         return dict(RUST_RESPONSE)
 
-    bridge.set_rust_chat_completions(
-        decline=lambda **_kwargs: None, achat_completions=native
-    )
+    bridge.set_rust_chat_completions(achat_completions=native)
     logging_obj = MagicMock()
 
     with patch.object(
@@ -476,9 +451,7 @@ def test_post_call_is_not_logged_twice_when_the_sync_rust_call_declines():
     logging_obj, calls = _recording_logging_obj()
 
     with patch.object(bridge, "get_native_bridge", lambda: _FakeNative()):
-        bridge.set_rust_chat_completions(
-            decline=lambda **_kwargs: None, chat_completions=declining_native
-        )
+        bridge.set_rust_chat_completions(chat_completions=declining_native)
         response = _run(
             logging_obj=logging_obj,
             client=_sync_client_returning_converse_response(),

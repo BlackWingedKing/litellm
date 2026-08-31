@@ -3,11 +3,8 @@
 The Rust core owns the conversation translation, the provider call, and the
 response normalization for the subset of `/chat/completions` requests it
 accepts. This module only marshals inputs and hands the normalized result to
-LiteLLM's existing `ModelResponse` builder.
-
-``None`` means the provider was never called, so the caller is free to serve the
-request on the Python path. A failure after the call was issued raises instead:
-retrying it there would bill the customer for the same work twice.
+LiteLLM's existing `ModelResponse` builder. The caller supplies the Python
+fallback, which runs only when the native route guarantees it sent nothing.
 """
 
 from __future__ import annotations
@@ -77,17 +74,6 @@ class RustAchatCompletions(Protocol):
         raise NotImplementedError
 
 
-class RustChatCompletionsDecline(Protocol):
-    def __call__(
-        self,
-        model: str,
-        messages: Sequence[object],
-        optional_params: Mapping[str, object] | None,
-        custom_llm_provider: str | None,
-    ) -> str | None:
-        raise NotImplementedError
-
-
 class ResponseObserver(Protocol):
     """Invoked with the payload the core returned, on success only.
 
@@ -139,7 +125,6 @@ _UNSET: Final[_Unset] = _Unset()
 class _RustChatCompletionsState:
     chat_completions: RustChatCompletions | None = None
     achat_completions: RustAchatCompletions | None = None
-    decline: RustChatCompletionsDecline | None = None
 
 
 _STATE: Final[_RustChatCompletionsState] = _RustChatCompletionsState()
@@ -149,7 +134,6 @@ def set_rust_chat_completions(
     *,
     chat_completions: RustChatCompletions | None | _Unset = _UNSET,
     achat_completions: RustAchatCompletions | None | _Unset = _UNSET,
-    decline: RustChatCompletionsDecline | None | _Unset = _UNSET,
 ) -> None:
     """Inject the native callables, so tests can supply a double instead of
     patching module attributes."""
@@ -157,8 +141,6 @@ def set_rust_chat_completions(
         _STATE.chat_completions = chat_completions
     if not isinstance(achat_completions, _Unset):
         _STATE.achat_completions = achat_completions
-    if not isinstance(decline, _Unset):
-        _STATE.decline = decline
 
 
 def load_rust_chat_completions() -> RustChatCompletions | None:
@@ -183,16 +165,6 @@ def load_rust_achat_completions() -> RustAchatCompletions | None:
 
 def _env_enables_rust() -> bool:
     return os.getenv("LITELLM_RUST", "").strip().lower() in _TRUTHY_ENV_VALUES
-
-
-def _load_rust_decline() -> RustChatCompletionsDecline | None:
-    if _STATE.decline is not None:
-        return _STATE.decline
-    native_bridge: Final = get_native_bridge()
-    if native_bridge is None:
-        return None
-    loaded: RustChatCompletionsDecline | None = getattr(native_bridge, "chat_completions_decline", None)
-    return loaded
 
 
 def _anthropic_user_id_reaches_the_body(litellm_params: Mapping[str, object] | None) -> bool:
@@ -233,22 +205,13 @@ def _litellm_metadata_reaches_the_provider(
             return False
 
 
-def rust_chat_completions_accepts(
+def should_attempt_rust_chat_completions(
     *,
-    model: str,
-    messages: Sequence[object],
-    optional_params: Mapping[str, object],
     custom_llm_provider: str | None,
     litellm_params: Mapping[str, object] | None,
     stream: object,
+    asynchronous: bool,
 ) -> bool:
-    """Whether the Rust path will serve this request.
-
-    Asked before the caller commits to either path, so pre-call logging is
-    emitted exactly once, on whichever path actually runs. The core's own
-    capability gate answers the second half; it resolves no credentials and
-    performs no I/O.
-    """
     if custom_llm_provider not in RUST_CHAT_COMPLETIONS_PROVIDERS:
         return False
     if stream:
@@ -257,28 +220,10 @@ def rust_chat_completions_accepts(
     if not opted_in and not _env_enables_rust():
         return False
     if _litellm_metadata_reaches_the_provider(custom_llm_provider, litellm_params):
-        verbose_logger.debug("Rust chat completions declined (litellm metadata user_id); using the Python path")
+        verbose_logger.debug("Rust chat completions skipped because Python owns provider metadata")
         return False
-    decline: Final = _load_rust_decline()
-    if decline is None:
-        return False
-    try:
-        reason: Final = decline(
-            model=model,
-            messages=messages,
-            optional_params=optional_params,
-            custom_llm_provider=custom_llm_provider,
-        )
-    except Exception as rust_error:  # noqa: BLE001  # rollout-safety fallback: any Rust bridge failure must fall back to the Python path
-        verbose_logger.debug(
-            "Rust chat completions gate raised %s; staying on the Python path",
-            type(rust_error).__name__,
-        )
-        return False
-    if reason is not None:
-        verbose_logger.debug("Rust chat completions declined (%s); using the Python path", reason)
-        return False
-    return True
+    native_call: Final = load_rust_achat_completions() if asynchronous else load_rust_chat_completions()
+    return native_call is not None
 
 
 def _rust_bridge_exceptions() -> tuple[type[BaseException], type[BaseException]] | None:
@@ -293,26 +238,15 @@ def _rust_bridge_exceptions() -> tuple[type[BaseException], type[BaseException]]
     return declined, upstream
 
 
-def _reraise_or_decline(
+def _raise_unless_declined(
     rust_error: BaseException,
     *,
     model: str,
     custom_llm_provider: str | None,
 ) -> None:
-    """Re-raise a failure the provider already saw, or return so the caller declines.
-
-    A request that never reached the provider is safe to serve on the Python
-    path. One that did is not: the provider has already done the work, so a
-    second attempt bills for it twice. Those surface as an `APIError` carrying
-    the upstream status, which LiteLLM's exception mapping already understands.
-    """
     exceptions: Final = _rust_bridge_exceptions()
     if exceptions is None:
-        verbose_logger.debug(
-            "Rust chat completions bridge raised %s; falling back to Python path",
-            type(rust_error).__name__,
-        )
-        return
+        raise rust_error
     declined, upstream_failed = exceptions
     if isinstance(rust_error, upstream_failed):
         args: Final = rust_error.args
@@ -346,7 +280,7 @@ def _build_model_response(
     return built
 
 
-def chat_completions(
+def chat_completions_or_fallback(
     *,
     model: str,
     messages: Sequence[object],
@@ -358,10 +292,11 @@ def chat_completions(
     extra_headers: Mapping[str, object] | None,
     timeout: float | httpx.Timeout | None,
     on_response: ResponseObserver,
-) -> ModelResponse | None:
+    python_fallback: Callable[[], object],
+) -> object:
     rust_chat_completions: Final = load_rust_chat_completions()
     if rust_chat_completions is None:
-        return None
+        return python_fallback()
     try:
         rust_response: Final = rust_chat_completions(
             model=model,
@@ -373,43 +308,9 @@ def chat_completions(
             extra_headers=extra_headers,
             timeout_seconds=timeout_to_seconds(timeout),
         )
-    except Exception as rust_error:  # noqa: BLE001  # rollout safety: the helper re-raises anything the provider already saw
-        _reraise_or_decline(rust_error, model=model, custom_llm_provider=custom_llm_provider)
-        return None
-    on_response(rust_response)
-    return _build_model_response(rust_response, model_response)
-
-
-async def achat_completions(
-    *,
-    model: str,
-    messages: Sequence[object],
-    optional_params: Mapping[str, object],
-    model_response: ModelResponse,
-    api_key: str | None,
-    api_base: str | None,
-    custom_llm_provider: str | None,
-    extra_headers: Mapping[str, object] | None,
-    timeout: float | httpx.Timeout | None,
-    on_response: ResponseObserver,
-) -> ModelResponse | None:
-    rust_achat_completions: Final = load_rust_achat_completions()
-    if rust_achat_completions is None:
-        return None
-    try:
-        rust_response: Final = await rust_achat_completions(
-            model=model,
-            messages=messages,
-            optional_params=optional_params,
-            api_key=api_key,
-            api_base=api_base,
-            custom_llm_provider=custom_llm_provider,
-            extra_headers=extra_headers,
-            timeout_seconds=timeout_to_seconds(timeout),
-        )
-    except Exception as rust_error:  # noqa: BLE001  # rollout safety: the helper re-raises anything the provider already saw
-        _reraise_or_decline(rust_error, model=model, custom_llm_provider=custom_llm_provider)
-        return None
+    except Exception as rust_error:  # noqa: BLE001  # native exception classes define whether fallback is safe
+        _raise_unless_declined(rust_error, model=model, custom_llm_provider=custom_llm_provider)
+        return python_fallback()
     on_response(rust_response)
     return _build_model_response(rust_response, model_response)
 
@@ -428,26 +329,22 @@ async def achat_completions_or_fallback(
     on_response: ResponseObserver,
     python_fallback: Callable[[], Awaitable[object]],
 ) -> object:
-    """Await the Rust path, falling back to the caller's own Python path when
-    the bridge is unavailable or the call fails.
-
-    The caller supplies the fallback, so the bridge stays free of provider
-    dispatch. This exists because a caller that dispatches asynchronously has
-    already returned a coroutine by the time a Rust failure surfaces, and so
-    cannot fall back on its own.
-    """
-    response: Final = await achat_completions(
-        model=model,
-        messages=messages,
-        optional_params=optional_params,
-        model_response=model_response,
-        api_key=api_key,
-        api_base=api_base,
-        custom_llm_provider=custom_llm_provider,
-        extra_headers=extra_headers,
-        timeout=timeout,
-        on_response=on_response,
-    )
-    if response is not None:
-        return response
-    return await python_fallback()
+    rust_achat_completions: Final = load_rust_achat_completions()
+    if rust_achat_completions is None:
+        return await python_fallback()
+    try:
+        rust_response: Final = await rust_achat_completions(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            api_key=api_key,
+            api_base=api_base,
+            custom_llm_provider=custom_llm_provider,
+            extra_headers=extra_headers,
+            timeout_seconds=timeout_to_seconds(timeout),
+        )
+    except Exception as rust_error:  # noqa: BLE001  # native exception classes define whether fallback is safe
+        _raise_unless_declined(rust_error, model=model, custom_llm_provider=custom_llm_provider)
+        return await python_fallback()
+    on_response(rust_response)
+    return _build_model_response(rust_response, model_response)
