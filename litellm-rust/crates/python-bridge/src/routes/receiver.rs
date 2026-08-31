@@ -2,16 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::{Stream, StreamExt, pin_mut};
-use litellm_core::error::CoreError;
+use litellm_core::Error;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-
-use crate::errors::{BridgeResult, Error};
 
 const BRIDGE_CHANNEL_CAPACITY: usize = 1;
 
 struct ReceiverState<T> {
-    receiver: Mutex<mpsc::Receiver<BridgeResult<T>>>,
+    receiver: Mutex<mpsc::Receiver<Result<T, Error>>>,
     reading: AtomicBool,
     closed: AtomicBool,
     producer: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -43,7 +41,7 @@ impl Drop for ReadGuard<'_> {
 impl<T: Send + 'static> BridgeReceiver<T> {
     pub(super) fn from_stream<S>(stream: S) -> Self
     where
-        S: Stream<Item = BridgeResult<T>> + Send + 'static,
+        S: Stream<Item = Result<T, Error>> + Send + 'static,
     {
         let (sender, receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
         let producer = pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
@@ -65,12 +63,12 @@ impl<T: Send + 'static> BridgeReceiver<T> {
         }
     }
 
-    pub(super) async fn next(&self) -> BridgeResult<Option<T>> {
+    pub(super) async fn next(&self) -> Result<Option<T>, Error> {
         if self.state.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
         if self.state.reading.swap(true, Ordering::AcqRel) {
-            return Err(Error::Core(CoreError::InvalidRequest(
+            return Err(Error::possibly_sent(Error::InvalidRequest(
                 "native stream does not support concurrent reads".to_string(),
             )));
         }
@@ -115,14 +113,15 @@ mod tests {
     async fn receiver_preserves_items_and_terminal_error() {
         let receiver = BridgeReceiver::from_stream(stream::iter([
             Ok(vec![1_u8]),
-            Err(Error::Core(CoreError::Network("broken".to_string()))),
+            Err(Error::possibly_sent(Error::Network("broken".to_string()))),
             Ok(vec![2_u8]),
         ]));
 
         assert_eq!(receiver.next().await.expect("first item"), Some(vec![1]));
         assert!(matches!(
             receiver.next().await,
-            Err(Error::Core(CoreError::Network(message))) if message == "broken"
+            Err(Error::PossiblySent(error))
+                if matches!(error.as_ref(), Error::Network(message) if message == "broken")
         ));
         assert_eq!(receiver.next().await.expect("closed after error"), None);
     }
@@ -175,8 +174,9 @@ mod tests {
 
         assert!(matches!(
             receiver.next().await,
-            Err(Error::Core(CoreError::InvalidRequest(message)))
-                if message == "native stream does not support concurrent reads"
+            Err(Error::PossiblySent(error))
+                if matches!(error.as_ref(), Error::InvalidRequest(message)
+                    if message == "native stream does not support concurrent reads")
         ));
         receiver.close();
         pending
@@ -191,7 +191,7 @@ mod tests {
         let producer_dropped = dropped.clone();
         let source = stream::once(async move {
             let _flag = DropFlag(producer_dropped);
-            std::future::pending::<BridgeResult<Vec<u8>>>().await
+            std::future::pending::<Result<Vec<u8>, Error>>().await
         });
         let receiver = BridgeReceiver::from_stream(source);
         tokio::time::sleep(Duration::from_millis(10)).await;

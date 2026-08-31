@@ -15,7 +15,7 @@ pub mod response_utils;
 pub mod transformation;
 pub mod types;
 
-use crate::error::{ProviderCallError, ProviderCallResult};
+use crate::error::Error;
 
 use crate::streaming::{
     OpenedStream, StreamApi, StreamCapability, StreamTransport, supports_streaming,
@@ -28,25 +28,25 @@ use types::{
 
 pub async fn chat_completions(
     request: ChatCompletionsRequest<'_>,
-) -> ProviderCallResult<ChatCompletionsResponse> {
-    let prepared = prepare_chat_completions_call(request).map_err(ProviderCallError::NotSent)?;
+) -> Result<ChatCompletionsResponse, Error> {
+    let prepared = prepare_chat_completions_call(request).map_err(Error::not_sent)?;
     execute_chat_completions_provider_call(prepared).await
 }
 
 pub async fn chat_completions_stream(
     request: ChatCompletionsStreamRequest,
-) -> ProviderCallResult<OpenedStream<ChatStreamEvent>> {
+) -> Result<OpenedStream<ChatStreamEvent>, Error> {
     let capability = StreamCapability {
         api: StreamApi::ChatCompletions,
         provider: request.context.provider,
         transport: StreamTransport::Http,
     };
     if !supports_streaming(capability) {
-        return Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+        return Err(Error::not_sent(crate::Error::Unsupported(
             "chat completions streaming",
         )));
     }
-    Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+    Err(Error::not_sent(crate::Error::Unsupported(
         "chat completions streaming provider registration",
     )))
 }

@@ -1,5 +1,4 @@
-use litellm_core::CoreResult;
-use litellm_core::error::CoreError;
+use litellm_core::error::Error;
 use litellm_core::ocr::transformation::OcrResponseHandling;
 use serde_json::Value;
 
@@ -7,7 +6,7 @@ use super::common_utils::{poll_document_intelligence, truncate_error_body};
 use super::types::ProviderOcrRequest;
 use crate::client::http_client;
 
-pub(crate) async fn execute_ocr_provider_call(request: ProviderOcrRequest) -> CoreResult<Value> {
+pub(crate) async fn execute_ocr_provider_call(request: ProviderOcrRequest) -> Result<Value, Error> {
     let mut request_builder = http_client().post(&request.url).json(&request.body);
     for (key, value) in &request.upstream_headers {
         request_builder = request_builder.header(key, value);
@@ -19,7 +18,7 @@ pub(crate) async fn execute_ocr_provider_call(request: ProviderOcrRequest) -> Co
     let response = request_builder
         .send()
         .await
-        .map_err(|err| CoreError::Network(err.to_string()))?;
+        .map_err(Error::from_send_error)?;
 
     let status = response.status();
     if request.config.response_handling() == OcrResponseHandling::AzureDocumentIntelligencePoll
@@ -31,10 +30,10 @@ pub(crate) async fn execute_ocr_provider_call(request: ProviderOcrRequest) -> Co
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
             .ok_or_else(|| {
-                CoreError::InvalidResponse(
+                Error::possibly_sent(Error::InvalidResponse(
                     "Azure Document Intelligence returned 202 but no Operation-Location header found"
                         .to_string(),
-                )
+                ))
             })?;
         let response_json = poll_document_intelligence(
             &operation_url,
@@ -42,30 +41,36 @@ pub(crate) async fn execute_ocr_provider_call(request: ProviderOcrRequest) -> Co
             &request.upstream_headers,
             request.timeout,
         )
-        .await?;
-        return Ok(request
+        .await
+        .map_err(Error::possibly_sent)?;
+        return request
             .config
-            .transform_ocr_response(&request.model, response_json)?
-            .into_json());
+            .transform_ocr_response(&request.model, response_json)
+            .map(|response| response.into_json())
+            .map_err(Error::possibly_sent);
     }
 
     let text = response
         .text()
         .await
-        .map_err(|err| CoreError::Network(err.to_string()))?;
+        .map_err(|err| Error::possibly_sent(Error::Network(err.to_string())))?;
 
     if !status.is_success() {
-        return Err(CoreError::Http {
+        return Err(Error::possibly_sent(Error::Http {
             status: status.as_u16(),
             body: truncate_error_body(&text),
-        });
+        }));
     }
 
-    let response_json: Value = serde_json::from_str(&text)
-        .map_err(|err| CoreError::InvalidResponse(format!("invalid OCR response JSON: {err}")))?;
+    let response_json: Value = serde_json::from_str(&text).map_err(|err| {
+        Error::possibly_sent(Error::InvalidResponse(format!(
+            "invalid OCR response JSON: {err}"
+        )))
+    })?;
 
-    Ok(request
+    request
         .config
-        .transform_ocr_response(&request.model, response_json)?
-        .into_json())
+        .transform_ocr_response(&request.model, response_json)
+        .map(|response| response.into_json())
+        .map_err(Error::possibly_sent)
 }

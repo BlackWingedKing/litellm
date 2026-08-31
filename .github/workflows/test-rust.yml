@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - "litellm-rust/**"
+      - "litellm/rust_bridge/**"
+      - "tests/test_litellm/rust_bridge/test_native_integration.py"
       - ".cargo/**"
       - "pyproject.toml"
       - ".github/scripts/smoke_test_native_wheel.py"
@@ -17,6 +19,8 @@ on:
       - "litellm_**"
     paths:
       - "litellm-rust/**"
+      - "litellm/rust_bridge/**"
+      - "tests/test_litellm/rust_bridge/test_native_integration.py"
       - ".cargo/**"
       - "pyproject.toml"
       - ".github/scripts/smoke_test_native_wheel.py"
@@ -128,6 +132,17 @@ jobs:
           RELEASE_WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           RELEASE_WHEEL_REPORT: dist/release-wheel-report.md
         run: python .github/scripts/verify_linux_native_wheel.py dist/*.whl
+
+      - name: Test Python-Rust bridge contract from release wheel
+        env:
+          LITELLM_REQUIRE_NATIVE_BRIDGE: "1"
+        run: |
+          uv venv --python python3.12 .native-test
+          uv pip install --python .native-test/bin/python dist/*.whl pytest==9.0.3 pytest-asyncio==1.3.0
+          cd /tmp
+          "$GITHUB_WORKSPACE/.native-test/bin/python" -m pytest \
+            "$GITHUB_WORKSPACE/tests/test_litellm/rust_bridge/test_native_integration.py" \
+            --rootdir=/tmp -q
 
       - name: Build panic contract wheel
         run: >-

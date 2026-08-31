@@ -2,7 +2,7 @@ pub mod instrumentation;
 pub mod types;
 pub mod websocket;
 
-use crate::error::{ProviderCallError, ProviderCallResult};
+use crate::error::Error;
 use crate::streaming::{
     OpenedStream, StreamApi, StreamCapability, StreamTransport, supports_streaming,
 };
@@ -11,36 +11,36 @@ use websocket::TypedResponsesWebSocketSession;
 
 pub async fn responses_stream(
     request: ResponsesStreamRequest,
-) -> ProviderCallResult<OpenedStream<ResponsesStreamEvent>> {
+) -> Result<OpenedStream<ResponsesStreamEvent>, Error> {
     let capability = StreamCapability {
         api: StreamApi::Responses,
         provider: request.context.provider,
         transport: StreamTransport::Http,
     };
     if !supports_streaming(capability) {
-        return Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+        return Err(Error::not_sent(crate::Error::Unsupported(
             "responses HTTP streaming",
         )));
     }
-    Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+    Err(Error::not_sent(crate::Error::Unsupported(
         "responses HTTP streaming provider registration",
     )))
 }
 
 pub async fn responses_websocket(
     request: ResponsesWebSocketRequest,
-) -> ProviderCallResult<Box<dyn TypedResponsesWebSocketSession>> {
+) -> Result<Box<dyn TypedResponsesWebSocketSession>, Error> {
     let capability = StreamCapability {
         api: StreamApi::Responses,
         provider: request.context.provider,
         transport: StreamTransport::WebSocket,
     };
     if !supports_streaming(capability) {
-        return Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+        return Err(Error::not_sent(crate::Error::Unsupported(
             "responses WebSocket streaming",
         )));
     }
-    Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+    Err(Error::not_sent(crate::Error::Unsupported(
         "responses WebSocket streaming provider registration",
     )))
 }

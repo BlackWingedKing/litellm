@@ -14,4 +14,4 @@ pub mod router;
 pub mod routing_utils;
 pub mod streaming;
 
-pub use error::{CoreError, CoreResult};
+pub use error::Error;

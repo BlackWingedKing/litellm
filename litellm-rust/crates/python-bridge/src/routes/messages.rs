@@ -1,9 +1,9 @@
 use litellm_core::messages::messages as run_messages;
 use litellm_core::messages::types::{AnthropicMessagesResponse, MessagesRequest};
+use litellm_core::Error;
 use pyo3::prelude::*;
 use serde_json::Value;
 
-use crate::errors::BridgeResult;
 use crate::marshal::{RouteOptions, required_value};
 use crate::routes::BridgeRoute;
 
@@ -15,7 +15,7 @@ struct MessagesCall {
 impl BridgeRoute<MessagesInputs> for MessagesCall {
     type Output = AnthropicMessagesResponse;
 
-    fn from_python(py: Python<'_>, inputs: MessagesInputs) -> BridgeResult<Self> {
+    fn from_python(py: Python<'_>, inputs: MessagesInputs) -> PyResult<Self> {
         Ok(Self {
             options: RouteOptions::from_python(
                 py,
@@ -30,7 +30,7 @@ impl BridgeRoute<MessagesInputs> for MessagesCall {
         })
     }
 
-    async fn run(self) -> BridgeResult<AnthropicMessagesResponse> {
+    async fn run(self) -> Result<AnthropicMessagesResponse, Error> {
         let RouteOptions {
             model,
             api_key,
@@ -49,7 +49,6 @@ impl BridgeRoute<MessagesInputs> for MessagesCall {
             timeout,
         })
         .await
-        .map_err(Into::into)
     }
 }
 

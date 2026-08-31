@@ -1,17 +1,16 @@
 use std::future::Future;
 use std::sync::mpsc::sync_channel;
 
+use litellm_core::Error;
 use litellm_python_interop::{release_gil, to_py};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use serde::Serialize;
 
-use crate::errors::BridgeResult;
-
 pub(super) fn run_sync_with<T, F, C>(py: Python<'_>, future: F, convert: C) -> PyResult<Py<PyAny>>
 where
     T: Send + 'static,
-    F: Future<Output = BridgeResult<T>> + Send + 'static,
+    F: Future<Output = Result<T, Error>> + Send + 'static,
     C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>>,
 {
     let (sender, receiver) = sync_channel(1);
@@ -20,7 +19,7 @@ where
     });
     let task_result = release_gil(py, move || receiver.recv())
         .map_err(|_| PyRuntimeError::new_err("native route task terminated"))?;
-    let result = task_result?;
+    let result = task_result.map_err(crate::errors::to_pyerr)?;
     convert(py, result)
 }
 
@@ -31,11 +30,11 @@ pub(super) fn run_async_with<T, F, C>(
 ) -> PyResult<Bound<'_, PyAny>>
 where
     T: Send + 'static,
-    F: Future<Output = BridgeResult<T>> + Send + 'static,
+    F: Future<Output = Result<T, Error>> + Send + 'static,
     C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
 {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let result = future.await?;
+        let result = future.await.map_err(crate::errors::to_pyerr)?;
         Python::attach(|py| convert(py, result))
     })
 }
@@ -43,7 +42,7 @@ where
 pub(super) fn run_sync<T, F>(py: Python<'_>, future: F) -> PyResult<Py<PyAny>>
 where
     T: Serialize + Send + 'static,
-    F: Future<Output = BridgeResult<T>> + Send + 'static,
+    F: Future<Output = Result<T, Error>> + Send + 'static,
 {
     run_sync_with(py, future, |py, value| to_py(py, &value))
 }
@@ -51,7 +50,7 @@ where
 pub(super) fn run_async<T, F>(py: Python<'_>, future: F) -> PyResult<Bound<'_, PyAny>>
 where
     T: Serialize + Send + 'static,
-    F: Future<Output = BridgeResult<T>> + Send + 'static,
+    F: Future<Output = Result<T, Error>> + Send + 'static,
 {
     run_async_with(py, future, |py, value| to_py(py, &value))
 }

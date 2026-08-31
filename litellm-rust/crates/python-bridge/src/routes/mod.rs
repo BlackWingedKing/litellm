@@ -3,7 +3,7 @@ use std::future::Future;
 use pyo3::prelude::*;
 use serde::Serialize;
 
-use crate::errors::BridgeResult;
+use litellm_core::Error;
 
 mod receiver;
 mod runtime;
@@ -13,9 +13,9 @@ use runtime::{run_async, run_sync};
 trait BridgeRoute<I>: Sized {
     type Output: Serialize + Send + 'static;
 
-    fn from_python(py: Python<'_>, inputs: I) -> BridgeResult<Self>;
+    fn from_python(py: Python<'_>, inputs: I) -> PyResult<Self>;
 
-    fn run(self) -> impl Future<Output = BridgeResult<Self::Output>> + Send + 'static;
+    fn run(self) -> impl Future<Output = Result<Self::Output, Error>> + Send + 'static;
 }
 
 macro_rules! bridge_route {
@@ -44,7 +44,7 @@ macro_rules! bridge_route {
             let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
-            })?;
+            }).map_err(crate::errors::declined)?;
             crate::routes::run_sync(py, <$call as crate::routes::BridgeRoute<$inputs>>::run(call))
         }
 
@@ -59,7 +59,7 @@ macro_rules! bridge_route {
             let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
-            })?;
+            }).map_err(crate::errors::declined)?;
             crate::routes::run_async(py, <$call as crate::routes::BridgeRoute<$inputs>>::run(call))
         }
 

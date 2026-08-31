@@ -1,4 +1,4 @@
-use crate::error::CoreResult;
+use crate::error::Error;
 use crate::streaming::StreamProvider;
 
 use super::types::{
@@ -36,13 +36,13 @@ pub trait AnthropicMessagesProviderConfig: Sync {
         api_base: Option<&str>,
         model: &str,
         env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> CoreResult<String>;
+    ) -> Result<String, Error>;
 
     fn resolve_api_key(
         &self,
         api_key: Option<&str>,
         env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> CoreResult<String>;
+    ) -> Result<String, Error>;
 
     fn auth_strategy(&self) -> MessagesAuthStrategy {
         MessagesAuthStrategy::Header("x-api-key")
@@ -62,7 +62,7 @@ pub trait AnthropicMessagesProviderConfig: Sync {
     fn transform_request(
         &self,
         request: AnthropicMessagesRequest,
-    ) -> CoreResult<AnthropicMessagesRequest> {
+    ) -> Result<AnthropicMessagesRequest, Error> {
         Ok(request)
     }
 
@@ -70,7 +70,7 @@ pub trait AnthropicMessagesProviderConfig: Sync {
         &self,
         _model: &str,
         response: AnthropicMessagesResponse,
-    ) -> CoreResult<AnthropicMessagesResponse> {
+    ) -> Result<AnthropicMessagesResponse, Error> {
         Ok(response)
     }
 }

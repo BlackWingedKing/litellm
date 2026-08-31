@@ -14,7 +14,7 @@ mod prepare;
 pub mod transformation;
 pub mod types;
 
-use crate::error::{CoreResult, ProviderCallError, ProviderCallResult};
+use crate::error::Error;
 use crate::streaming::{
     OpenedStream, StreamApi, StreamCapability, StreamTransport, supports_streaming,
 };
@@ -25,28 +25,30 @@ use types::{
     AnthropicMessagesResponse, MessagesRequest, MessagesStreamEvent, MessagesStreamRequest,
 };
 
-pub async fn messages(request: MessagesRequest<'_>) -> CoreResult<AnthropicMessagesResponse> {
-    execute_messages_provider_call(prepare_messages_call(request)?).await
+pub async fn messages(request: MessagesRequest<'_>) -> Result<AnthropicMessagesResponse, Error> {
+    let prepared = prepare_messages_call(request).map_err(Error::not_sent)?;
+    execute_messages_provider_call(prepared).await
 }
 
-pub async fn messages_stream(request: MessagesRequest<'_>) -> CoreResult<reqwest::Response> {
-    execute_messages_provider_stream(prepare_messages_call(request)?).await
+pub async fn messages_stream(request: MessagesRequest<'_>) -> Result<reqwest::Response, Error> {
+    let prepared = prepare_messages_call(request).map_err(Error::not_sent)?;
+    execute_messages_provider_stream(prepared).await
 }
 
 pub async fn messages_event_stream(
     request: MessagesStreamRequest,
-) -> ProviderCallResult<OpenedStream<MessagesStreamEvent>> {
+) -> Result<OpenedStream<MessagesStreamEvent>, Error> {
     let capability = StreamCapability {
         api: StreamApi::Messages,
         provider: request.context.provider,
         transport: StreamTransport::Http,
     };
     if !supports_streaming(capability) {
-        return Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+        return Err(Error::not_sent(crate::Error::Unsupported(
             "messages event streaming",
         )));
     }
-    Err(ProviderCallError::NotSent(crate::CoreError::Unsupported(
+    Err(Error::not_sent(crate::Error::Unsupported(
         "messages event streaming provider registration",
     )))
 }

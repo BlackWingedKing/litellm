@@ -5,7 +5,7 @@ mod routes;
 
 use pyo3::prelude::*;
 
-pub use errors::Error;
+pub use litellm_core::Error;
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {

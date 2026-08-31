@@ -1,20 +1,11 @@
-use thiserror::Error;
+use thiserror::Error as ThisError;
 
-pub type CoreResult<T> = Result<T, CoreError>;
-pub type ProviderCallResult<T> = Result<T, ProviderCallError>;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ProviderCallError {
-    /// The provider received no request, so a host may use another implementation.
+#[derive(Debug, ThisError, PartialEq, Eq)]
+pub enum Error {
     #[error("provider request was not sent: {0}")]
-    NotSent(#[source] CoreError),
-    /// The provider may have received the request, so retrying could duplicate work.
+    NotSent(#[source] Box<Error>),
     #[error("provider request may have been sent: {0}")]
-    PossiblySent(#[source] CoreError),
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum CoreError {
+    PossiblySent(#[source] Box<Error>),
     #[error("expected {expected}, got {actual}")]
     InvalidType {
         expected: &'static str,
@@ -47,6 +38,30 @@ pub enum CoreError {
     /// keep a reference implementation treat this as "fall back", not "fail".
     #[error("unsupported by the rust path: {0}")]
     Unsupported(&'static str),
+}
+
+impl Error {
+    pub fn not_sent(error: Error) -> Self {
+        Self::NotSent(Box::new(error))
+    }
+
+    pub fn possibly_sent(error: Error) -> Self {
+        Self::PossiblySent(Box::new(error))
+    }
+
+    pub fn from_send_error(error: reqwest::Error) -> Self {
+        if error.is_connect() {
+            return Self::not_sent(Self::Connect(error.to_string()));
+        }
+        Self::possibly_sent(Self::Network(error.to_string()))
+    }
+
+    pub fn root(&self) -> &Error {
+        match self {
+            Self::NotSent(error) | Self::PossiblySent(error) => error.root(),
+            error => error,
+        }
+    }
 }
 
 pub fn json_type_name(value: &serde_json::Value) -> &'static str {

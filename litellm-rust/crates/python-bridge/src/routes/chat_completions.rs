@@ -1,9 +1,9 @@
 use litellm_core::chat_completions::types::{ChatCompletionsRequest, ChatCompletionsResponse};
 use litellm_core::chat_completions::chat_completions as run_chat_completions;
+use litellm_core::Error;
 use pyo3::prelude::*;
 use serde_json::{Map, Value};
 
-use crate::errors::{BridgeResult, Error};
 use crate::marshal::{RouteOptions, object_or_empty, required_value};
 use crate::routes::BridgeRoute;
 
@@ -16,32 +16,29 @@ struct ChatCompletionsCall {
 impl BridgeRoute<ChatCompletionsInputs> for ChatCompletionsCall {
     type Output = ChatCompletionsResponse;
 
-    fn from_python(py: Python<'_>, inputs: ChatCompletionsInputs) -> BridgeResult<Self> {
-        (|| -> PyResult<Self> {
-            Ok(Self {
-                options: RouteOptions::from_python(
-                    py,
-                    inputs.model,
-                    inputs.api_key,
-                    inputs.api_base,
-                    inputs.custom_llm_provider,
-                    inputs.extra_headers,
-                    inputs.timeout_seconds,
-                )?,
-                messages: required_value(
-                    py,
-                    "messages",
-                    inputs.messages,
-                    Value::is_array,
-                    "list",
-                )?,
-                optional_params: object_or_empty(py, "optional_params", inputs.optional_params)?,
-            })
-        })()
-        .map_err(Error::declined)
+    fn from_python(py: Python<'_>, inputs: ChatCompletionsInputs) -> PyResult<Self> {
+        Ok(Self {
+            options: RouteOptions::from_python(
+                py,
+                inputs.model,
+                inputs.api_key,
+                inputs.api_base,
+                inputs.custom_llm_provider,
+                inputs.extra_headers,
+                inputs.timeout_seconds,
+            )?,
+            messages: required_value(
+                py,
+                "messages",
+                inputs.messages,
+                Value::is_array,
+                "list",
+            )?,
+            optional_params: object_or_empty(py, "optional_params", inputs.optional_params)?,
+        })
     }
 
-    async fn run(self) -> BridgeResult<ChatCompletionsResponse> {
+    async fn run(self) -> Result<ChatCompletionsResponse, Error> {
         let RouteOptions {
             model,
             api_key,
@@ -61,7 +58,6 @@ impl BridgeRoute<ChatCompletionsInputs> for ChatCompletionsCall {
             timeout,
         })
         .await
-        .map_err(Into::into)
     }
 }
 

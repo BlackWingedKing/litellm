@@ -20,6 +20,7 @@ use litellm_core::streaming::{
     JsonObject, OpenedStream, ProviderCallContext, StreamApi, StreamCapability, StreamMetadata,
     StreamProviderId, StreamTransport,
 };
+use litellm_core::Error;
 use litellm_python_interop::{from_py, to_py};
 use pyo3::exceptions::{PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
@@ -27,7 +28,6 @@ use pyo3::types::{PyModule, PyType};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::errors::{BridgeResult, Error};
 use crate::marshal::{object_or_empty, optional_timeout, string_headers};
 use crate::routes::receiver::BridgeReceiver;
 use crate::routes::runtime::{run_async, run_async_with, run_sync_with};
@@ -42,13 +42,9 @@ where
     E: Send + 'static,
 {
     fn from_opened(opened: OpenedStream<E>) -> Self {
-        let events = opened.events.map(|event| {
-            event.map_err(|error| {
-                Error::from(litellm_core::error::ProviderCallError::PossiblySent(
-                    error.into_core_error(),
-                ))
-            })
-        });
+        let events = opened
+            .events
+            .map(|event| event.map_err(Error::possibly_sent));
         Self {
             metadata: opened.metadata,
             receiver: BridgeReceiver::from_stream(events),
@@ -172,7 +168,7 @@ fn parse_call<B>(
     py: Python<'_>,
     request: Py<PyAny>,
     call: PythonProviderCallContext,
-) -> BridgeResult<(B, ProviderCallContext)>
+) -> PyResult<(B, ProviderCallContext)>
 where
     B: DeserializeOwned,
 {
@@ -206,7 +202,6 @@ where
             },
         ))
     })()
-    .map_err(Error::declined)
 }
 
 #[pyfunction]
@@ -234,14 +229,10 @@ fn chat_completions_stream(
             litellm_metadata,
         },
     )
-    .map_err(PyErr::from)?;
+    .map_err(crate::errors::declined)?;
     run_sync_with(
         py,
-        async move {
-            run_chat_completions_stream(ChatCompletionsStreamRequest { body, context })
-                .await
-                .map_err(Into::into)
-        },
+        async move { run_chat_completions_stream(ChatCompletionsStreamRequest { body, context }).await },
         |py, opened| Ok(Py::new(py, ChatCompletionsEventStream::from(opened))?.into_any()),
     )
 }
@@ -271,14 +262,10 @@ fn achat_completions_stream(
             litellm_metadata,
         },
     )
-    .map_err(PyErr::from)?;
+    .map_err(crate::errors::declined)?;
     run_async_with(
         py,
-        async move {
-            run_chat_completions_stream(ChatCompletionsStreamRequest { body, context })
-                .await
-                .map_err(Into::into)
-        },
+        async move { run_chat_completions_stream(ChatCompletionsStreamRequest { body, context }).await },
         |py, opened| Ok(Py::new(py, ChatCompletionsEventStream::from(opened))?.into_any()),
     )
 }
@@ -308,14 +295,10 @@ fn messages_stream(
             litellm_metadata,
         },
     )
-    .map_err(PyErr::from)?;
+    .map_err(crate::errors::declined)?;
     run_sync_with(
         py,
-        async move {
-            run_messages_stream(MessagesStreamRequest { body, context })
-                .await
-                .map_err(Into::into)
-        },
+        async move { run_messages_stream(MessagesStreamRequest { body, context }).await },
         |py, opened| Ok(Py::new(py, MessagesEventStream::from(opened))?.into_any()),
     )
 }
@@ -345,14 +328,10 @@ fn amessages_stream(
             litellm_metadata,
         },
     )
-    .map_err(PyErr::from)?;
+    .map_err(crate::errors::declined)?;
     run_async_with(
         py,
-        async move {
-            run_messages_stream(MessagesStreamRequest { body, context })
-                .await
-                .map_err(Into::into)
-        },
+        async move { run_messages_stream(MessagesStreamRequest { body, context }).await },
         |py, opened| Ok(Py::new(py, MessagesEventStream::from(opened))?.into_any()),
     )
 }
@@ -382,14 +361,10 @@ fn responses_stream(
             litellm_metadata,
         },
     )
-    .map_err(PyErr::from)?;
+    .map_err(crate::errors::declined)?;
     run_sync_with(
         py,
-        async move {
-            run_responses_stream(ResponsesStreamRequest { body, context })
-                .await
-                .map_err(Into::into)
-        },
+        async move { run_responses_stream(ResponsesStreamRequest { body, context }).await },
         |py, opened| Ok(Py::new(py, ResponsesEventStream::from(opened))?.into_any()),
     )
 }
@@ -419,14 +394,10 @@ fn aresponses_stream(
             litellm_metadata,
         },
     )
-    .map_err(PyErr::from)?;
+    .map_err(crate::errors::declined)?;
     run_async_with(
         py,
-        async move {
-            run_responses_stream(ResponsesStreamRequest { body, context })
-                .await
-                .map_err(Into::into)
-        },
+        async move { run_responses_stream(ResponsesStreamRequest { body, context }).await },
         |py, opened| Ok(Py::new(py, ResponsesEventStream::from(opened))?.into_any()),
     )
 }
@@ -477,14 +448,10 @@ impl ResponsesWebSocketSession {
                 litellm_metadata,
             },
         )
-        .map_err(PyErr::from)?;
+        .map_err(crate::errors::declined)?;
         run_async_with(
             py,
-            async move {
-                run_responses_websocket(ResponsesWebSocketRequest { context })
-                    .await
-                    .map_err(Into::into)
-            },
+            async move { run_responses_websocket(ResponsesWebSocketRequest { context }).await },
             |py, session| {
                 Ok(Py::new(
                     py,
@@ -505,7 +472,7 @@ impl ResponsesWebSocketSession {
         let command: ResponseCommand = from_py(command.bind(py))?;
         let session = self.session.clone();
         run_async(py, async move {
-            session.send(command).await.map_err(Into::into)
+            session.send(command).await.map_err(Error::possibly_sent)
         })
     }
 
@@ -513,7 +480,7 @@ impl ResponsesWebSocketSession {
         let session = self.session.clone();
         run_async_with(
             py,
-            async move { session.recv().await.map_err(Into::into) },
+            async move { session.recv().await.map_err(Error::possibly_sent) },
             |py, event| match event {
                 Some(event) => to_py(py, &event),
                 None => Ok(py.None()),
@@ -524,7 +491,7 @@ impl ResponsesWebSocketSession {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = self.session.clone();
         run_async(py, async move {
-            session.close().await.map_err(Into::into)
+            session.close().await.map_err(Error::possibly_sent)
         })
     }
 }

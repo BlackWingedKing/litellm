@@ -3,17 +3,15 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::error::Error;
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use thiserror::Error;
 
-use crate::error::{CoreError, CoreResult, ProviderCallError, ProviderCallResult};
-
-pub type EventStream<E> = Pin<Box<dyn Stream<Item = Result<E, StreamFailure>> + Send + 'static>>;
+pub type EventStream<E> = Pin<Box<dyn Stream<Item = Result<E, Error>> + Send + 'static>>;
 pub type ProviderChunkStream =
-    Pin<Box<dyn Stream<Item = Result<ProviderStreamChunk, StreamFailure>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<ProviderStreamChunk, Error>> + Send + 'static>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,14 +38,14 @@ pub enum StreamProviderId {
 }
 
 impl TryFrom<&str> for StreamApi {
-    type Error = CoreError;
+    type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "chat_completions" => Ok(Self::ChatCompletions),
             "messages" => Ok(Self::Messages),
             "responses" => Ok(Self::Responses),
-            _ => Err(CoreError::InvalidRequest(format!(
+            _ => Err(Error::InvalidRequest(format!(
                 "unknown streaming API: {value}"
             ))),
         }
@@ -55,13 +53,13 @@ impl TryFrom<&str> for StreamApi {
 }
 
 impl TryFrom<&str> for StreamTransport {
-    type Error = CoreError;
+    type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "http" => Ok(Self::Http),
             "websocket" => Ok(Self::WebSocket),
-            _ => Err(CoreError::InvalidRequest(format!(
+            _ => Err(Error::InvalidRequest(format!(
                 "unknown streaming transport: {value}"
             ))),
         }
@@ -69,7 +67,7 @@ impl TryFrom<&str> for StreamTransport {
 }
 
 impl TryFrom<&str> for StreamProviderId {
-    type Error = CoreError;
+    type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
@@ -77,7 +75,7 @@ impl TryFrom<&str> for StreamProviderId {
             "azure_ai" => Ok(Self::AzureAi),
             "bedrock" | "bedrock_converse" => Ok(Self::BedrockConverse),
             "openai" => Ok(Self::OpenAi),
-            _ => Err(CoreError::InvalidProvider(value.to_string())),
+            _ => Err(Error::InvalidProvider(value.to_string())),
         }
     }
 }
@@ -185,33 +183,12 @@ impl ProviderStreamChunk {
     }
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum StreamFailure {
-    #[error("provider stream network error: {0}")]
-    Network(String),
-    #[error("provider stream decode error: {0}")]
-    Decode(String),
-    #[error("invalid normalized stream event: {0}")]
-    InvalidEvent(String),
-}
-
-impl StreamFailure {
-    pub fn into_core_error(self) -> CoreError {
-        match self {
-            Self::Network(message) => CoreError::Network(message),
-            Self::Decode(message) | Self::InvalidEvent(message) => {
-                CoreError::InvalidResponse(message)
-            }
-        }
-    }
-}
-
 pub trait StreamDecoder: Send + 'static {
     type WireEvent: Send + 'static;
 
-    fn push(&mut self, chunk: ProviderStreamChunk) -> Result<Vec<Self::WireEvent>, StreamFailure>;
+    fn push(&mut self, chunk: ProviderStreamChunk) -> Result<Vec<Self::WireEvent>, Error>;
 
-    fn finish(&mut self) -> Result<Vec<Self::WireEvent>, StreamFailure> {
+    fn finish(&mut self) -> Result<Vec<Self::WireEvent>, Error> {
         Ok(Vec::new())
     }
 }
@@ -221,16 +198,16 @@ pub trait StreamProvider<R, E>: Send + Sync + 'static {
     type WireEvent: Send + 'static;
     type Decoder: StreamDecoder<WireEvent = Self::WireEvent>;
 
-    fn transform_request(&self, request: R) -> CoreResult<Self::PreparedRequest>;
+    fn transform_request(&self, request: R) -> Result<Self::PreparedRequest, Error>;
 
     fn call(
         &'static self,
         request: Self::PreparedRequest,
-    ) -> BoxFuture<'static, ProviderCallResult<OpenedWireStream>>;
+    ) -> BoxFuture<'static, Result<OpenedWireStream, Error>>;
 
     fn decoder(&self) -> Self::Decoder;
 
-    fn normalize(&self, event: Self::WireEvent) -> Result<Vec<E>, StreamFailure>;
+    fn normalize(&self, event: Self::WireEvent) -> Result<Vec<E>, Error>;
 }
 
 struct PipelineState<P: 'static, D, E, R>
@@ -240,7 +217,7 @@ where
     provider: &'static P,
     decoder: D,
     chunks: ProviderChunkStream,
-    pending: VecDeque<Result<E, StreamFailure>>,
+    pending: VecDeque<Result<E, Error>>,
     finished: bool,
     request: PhantomData<fn(R)>,
 }
@@ -248,7 +225,7 @@ where
 pub async fn open_provider_stream<P, R, E>(
     provider: &'static P,
     request: R,
-) -> ProviderCallResult<OpenedStream<E>>
+) -> Result<OpenedStream<E>, Error>
 where
     P: StreamProvider<R, E>,
     R: Send + 'static,
@@ -256,7 +233,7 @@ where
 {
     let prepared = provider
         .transform_request(request)
-        .map_err(ProviderCallError::NotSent)?;
+        .map_err(Error::not_sent)?;
     let opened = provider.call(prepared).await?;
     let state = PipelineState {
         provider,
@@ -342,10 +319,7 @@ mod tests {
     impl StreamDecoder for FakeDecoder {
         type WireEvent = String;
 
-        fn push(
-            &mut self,
-            chunk: ProviderStreamChunk,
-        ) -> Result<Vec<Self::WireEvent>, StreamFailure> {
+        fn push(&mut self, chunk: ProviderStreamChunk) -> Result<Vec<Self::WireEvent>, Error> {
             self.calls.lock().expect("call log").push("decode");
             self.pending
                 .push_str(std::str::from_utf8(chunk.as_bytes()).expect("test utf-8"));
@@ -358,7 +332,7 @@ mod tests {
             Ok(parts)
         }
 
-        fn finish(&mut self) -> Result<Vec<Self::WireEvent>, StreamFailure> {
+        fn finish(&mut self) -> Result<Vec<Self::WireEvent>, Error> {
             if self.pending.is_empty() {
                 return Ok(Vec::new());
             }
@@ -371,7 +345,7 @@ mod tests {
         type WireEvent = String;
         type Decoder = FakeDecoder;
 
-        fn transform_request(&self, _request: FakeRequest) -> CoreResult<Self::PreparedRequest> {
+        fn transform_request(&self, _request: FakeRequest) -> Result<Self::PreparedRequest, Error> {
             self.calls.lock().expect("call log").push("transform");
             Ok(PreparedRequest)
         }
@@ -379,7 +353,7 @@ mod tests {
         fn call(
             &'static self,
             _request: Self::PreparedRequest,
-        ) -> BoxFuture<'static, ProviderCallResult<OpenedWireStream>> {
+        ) -> BoxFuture<'static, Result<OpenedWireStream, Error>> {
             self.calls.lock().expect("call log").push("call");
             async move {
                 Ok(OpenedWireStream {
@@ -408,7 +382,7 @@ mod tests {
             }
         }
 
-        fn normalize(&self, event: Self::WireEvent) -> Result<Vec<String>, StreamFailure> {
+        fn normalize(&self, event: Self::WireEvent) -> Result<Vec<String>, Error> {
             self.calls.lock().expect("call log").push("normalize");
             Ok(vec![event.to_uppercase()])
         }
