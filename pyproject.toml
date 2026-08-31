@@ -270,6 +270,7 @@ manifest-path = "litellm-rust/crates/python-bridge/Cargo.toml"
 module-name = "litellm.rust_bridge._native"
 python-source = "."
 bindings = "pyo3"
+features = ["extension-module"]
 profile = "release"
 editable-profile = "dev"
 include = ["litellm/proxy/_experimental/out/**"]
