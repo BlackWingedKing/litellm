@@ -6,7 +6,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use serde::Serialize;
 
-use crate::errors::{BridgeError, BridgeResult};
+use crate::errors::BridgeResult;
 
 pub(super) fn run_sync_with<T, F, C>(py: Python<'_>, future: F, convert: C) -> PyResult<Py<PyAny>>
 where
@@ -18,9 +18,9 @@ where
     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
         let _ = sender.send(future.await);
     });
-    let result = release_gil(py, move || receiver.recv())
-        .map_err(|_| PyRuntimeError::new_err("native route task terminated"))?
-        .map_err(BridgeError::into_pyerr)?;
+    let task_result = release_gil(py, move || receiver.recv())
+        .map_err(|_| PyRuntimeError::new_err("native route task terminated"))?;
+    let result = task_result?;
     convert(py, result)
 }
 
@@ -35,7 +35,7 @@ where
     C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
 {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let result = future.await.map_err(BridgeError::into_pyerr)?;
+        let result = future.await?;
         Python::attach(|py| convert(py, result))
     })
 }

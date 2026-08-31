@@ -44,7 +44,7 @@ macro_rules! bridge_route {
             let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
-            }).map_err(crate::errors::BridgeError::into_pyerr)?;
+            })?;
             crate::routes::run_sync(py, <$call as crate::routes::BridgeRoute<$inputs>>::run(call))
         }
 
@@ -59,7 +59,7 @@ macro_rules! bridge_route {
             let call = <$call as crate::routes::BridgeRoute<$inputs>>::from_python(py, $inputs {
                 $($required_name,)*
                 $($optional_name),*
-            }).map_err(crate::errors::BridgeError::into_pyerr)?;
+            })?;
             crate::routes::run_async(py, <$call as crate::routes::BridgeRoute<$inputs>>::run(call))
         }
 
