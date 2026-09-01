@@ -7,6 +7,7 @@ on:
       - ".cargo/**"
       - "pyproject.toml"
       - ".github/scripts/smoke_test_native_wheel.py"
+      - ".github/scripts/test_native_routes.py"
       - ".github/scripts/verify_linux_native_wheel.py"
       - ".github/workflows/test-rust.yml"
   pull_request:
@@ -20,6 +21,7 @@ on:
       - ".cargo/**"
       - "pyproject.toml"
       - ".github/scripts/smoke_test_native_wheel.py"
+      - ".github/scripts/test_native_routes.py"
       - ".github/scripts/verify_linux_native_wheel.py"
       - ".github/workflows/test-rust.yml"
 
@@ -128,6 +130,9 @@ jobs:
           RELEASE_WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           RELEASE_WHEEL_REPORT: dist/release-wheel-report.md
         run: python .github/scripts/verify_linux_native_wheel.py dist/*.whl
+
+      - name: Test native route wheel
+        run: python .github/scripts/test_native_routes.py dist/*.whl
 
       - name: Build panic contract wheel
         run: >-
